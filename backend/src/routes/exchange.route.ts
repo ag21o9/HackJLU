@@ -240,6 +240,29 @@ async function uploadAssetMetadata(params: {
     }
 }
 
+async function uploadCollectionMetadata(params: {
+    name: string
+    description?: string
+    collectionMint?: string
+}): Promise<string | null> {
+    const metadata = {
+        name: params.name,
+        symbol: 'ESP-COLLECTION',
+        description: params.description ?? `Collection for ${params.name}`,
+        collectionMint: params.collectionMint ?? null,
+    }
+
+    try {
+        const uploaded = await uploadFile(
+            Buffer.from(JSON.stringify(metadata, null, 2), 'utf8'),
+            `${params.name.replace(/\s+/g, '-').toLowerCase()}-collection-metadata.json`,
+        )
+        return uploaded.url ?? null
+    } catch {
+        return null
+    }
+}
+
 function toJsonSafe(value: unknown): unknown {
     if (typeof value === 'bigint') return value.toString()
     if (value instanceof Date) return value.toISOString()
@@ -486,16 +509,35 @@ exchangeRouter.post('/admin/collections', async (req, res) => {
             return res.status(400).json({ message: 'name is required' })
         }
 
+        const normalizedName = name.trim()
+        const normalizedDescription = typeof description === 'string' ? description.trim() : null
+        const normalizedCollectionMint = typeof collectionMint === 'string' ? collectionMint.trim() : null
+        const providedMetadataUri = typeof metadataUri === 'string' ? metadataUri.trim() : null
+
+        const generatedMetadataUri = providedMetadataUri
+            ? null
+            : await uploadCollectionMetadata({
+                name: normalizedName,
+                ...(normalizedDescription ? { description: normalizedDescription } : {}),
+                ...(normalizedCollectionMint ? { collectionMint: normalizedCollectionMint } : {}),
+            })
+
+        const resolvedMetadataUri = providedMetadataUri || generatedMetadataUri
+
         const collection = await prisma.assetCollection.create({
             data: {
-                name: name.trim(),
-                description: typeof description === 'string' ? description.trim() : null,
-                collectionMint: typeof collectionMint === 'string' ? collectionMint.trim() : null,
-                metadataUri: typeof metadataUri === 'string' ? metadataUri.trim() : null,
+                name: normalizedName,
+                description: normalizedDescription,
+                collectionMint: normalizedCollectionMint,
+                metadataUri: resolvedMetadataUri,
             },
         })
 
-        return res.status(201).json({ message: 'Collection created', collection })
+        return res.status(201).json({
+            message: 'Collection created',
+            collection,
+            metadataSource: providedMetadataUri ? 'provided' : generatedMetadataUri ? 'generated' : 'none',
+        })
     } catch (error) {
         console.log(error)
         return res.status(500).json({ message: 'Failed to create collection' })

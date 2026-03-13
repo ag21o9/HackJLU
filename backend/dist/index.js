@@ -1,7 +1,9 @@
 import express from 'express';
 import userRouter from './routes/user.route.js';
 import exchangeRouter from './routes/exchange.route.js';
+import cors from 'cors';
 const app = express();
+app.use(cors());
 app.use(express.json());
 app.use('/user', userRouter);
 app.use('/api', exchangeRouter);
