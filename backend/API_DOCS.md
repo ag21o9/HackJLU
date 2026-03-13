@@ -1,261 +1,438 @@
-# Esports Exchange API — Frontend Developer Reference
+# Esports Exchange API Docs (Devnet)
 
-## Overview
+## 1) Product Model
 
-This backend exposes two route groups:
+This app uses two market layers:
 
-- `/api` for wallet auth, admin exchange setup, public market reads, and trading flows
-- `/user` for legacy user profile and wallet lookup endpoints
+1. **Asset market** (`TEAM` and `LAND` assets) priced by bonding curve.
+2. **Prediction market** (`TEAM_A` / `TEAM_B` positions) for match outcomes.
 
-Runtime base URL in local development:
+Prediction market is an **AMM/pool P2P model** (not orderbook). Users trade against a shared liquidity pool and curve state.
 
-- `http://localhost:3000`
+## 2) Base URL and Auth
 
-Mounted routes:
+- Base URL: `http://localhost:3000`
+- Exchange routes: `/api/*`
+- Legacy user profile routes: `/user/*`
 
-- Exchange routes: `http://localhost:3000/api`
-- User routes: `http://localhost:3000/user`
+### Token Matrix
 
-The product is a hybrid esports exchange MVP:
+- **No token required**
+  - `GET /`
+  - `POST /api/auth/wallet`
+  - `POST /api/auth/admin`
+  - `GET /api/teams`
+  - `GET /api/assets`
+  - `GET /api/assets/:assetId/owners`
+  - `GET /api/matches`
+  - `GET /api/markets`
+  - `GET /api/markets/:marketId/audit`
+  - `GET /api/debug/exchange-state`
 
-- Team assets are minted on Solana devnet and transferred through real SPL token transactions
-- Prediction market positions are accounted for off-chain in Prisma, but users still sign real Solana memo transactions as proof of intent
-- Every user trade follows a `prepare -> wallet sign -> broadcast -> confirm` workflow
+- **User token required** (`Authorization: Bearer <user_jwt>`)
+  - `/api/assets/*/prepare|confirm`
+  - `/api/markets/*/prepare|confirm`
 
-## Authentication
+- **Admin token required** (`Authorization: Bearer <admin_jwt>`) OR `x-admin-key`
+  - `/api/admin/*`
 
-Protected endpoints require:
+## 3) Config Knobs (Devnet)
 
-```http
-Authorization: Bearer <jwt>
+- `PLATFORM_FEE_BPS` (default `100` = 1.00%, max 200)
+- `CLAIM_SOL_PER_USDC` (default `0.0001`) for devnet payout conversion in claim confirm
+- `AUTH_SIGN_MESSAGE`
+- `ADMIN_WALLETS`
+
+### Volatility Presets
+
+- `LOW` -> `kFactor = 0.01`
+- `MEDIUM` -> `kFactor = 0.05`
+- `HIGH` -> `kFactor = 0.1`
+
+Admin can pass either explicit `kFactor`/`bondingCurveK` or `volatilityPreset`.
+
+---
+
+## 4) Happy Path Demo Script (Admin -> User -> Result -> Claim)
+
+### Step A1: Admin sign-in
+
+`POST /api/auth/admin`
+
+Request:
+
+```json
+{
+  "walletAddress": "9FcnPPxpWC4u3tXPQRx3Bg5kPNVgXhXKoyBeqmF1PRMK",
+  "signature": "<base64 signature of AUTH_SIGN_MESSAGE>"
+}
 ```
-
-JWT tokens are issued by:
-
-- `POST /api/auth/wallet` — regular users
-- `POST /api/auth/admin` — admin wallets only
-- `POST /user/signin` (legacy flow)
-
-## Admin Authorization
-
-Admin endpoints accept either of these authorization models:
-
-1. JWT issued by `POST /api/auth/admin` (wallet must be in `ADMIN_WALLETS`)
-2. `x-admin-key: <ADMIN_API_KEY>` header if `ADMIN_API_KEY` is configured
-
-Recommended admin request headers:
-
-```http
-Authorization: Bearer <jwt>
-Content-Type: application/json
-x-admin-key: <ADMIN_API_KEY>
-```
-
-## Standard Trading Workflow
-
-All user trading endpoints now use this pattern.
-
-1. Frontend calls a `prepare` endpoint.
-2. Backend returns `unsignedTx` and a `preview` object.
-3. Frontend deserializes the transaction and asks Phantom to sign it.
-4. Frontend broadcasts the signed transaction to Solana devnet.
-5. Frontend sends the resulting `txSignature` to the matching `confirm` endpoint.
-6. Backend verifies the on-chain memo and then updates the database.
-
-Frontend reference flow:
-
-```javascript
-const prepare = await fetch('http://localhost:3000/api/assets/buy/prepare', {
-  method: 'POST',
-  headers: {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${token}`,
-  },
-  body: JSON.stringify({
-    assetId: 'cm8asset123',
-    quantity: 2,
-  }),
-}).then((r) => r.json())
-
-const tx = Transaction.from(Buffer.from(prepare.unsignedTx, 'base64'))
-const signedTx = await wallet.signTransaction(tx)
-const txSignature = await connection.sendRawTransaction(signedTx.serialize())
-await connection.confirmTransaction(txSignature, 'confirmed')
-
-const confirm = await fetch('http://localhost:3000/api/assets/buy/confirm', {
-  method: 'POST',
-  headers: {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${token}`,
-  },
-  body: JSON.stringify({
-    txSignature,
-    assetId: 'cm8asset123',
-    quantity: 2,
-  }),
-}).then((r) => r.json())
-```
-
-## Root Endpoint
-
-### GET /
-
-Health-style root endpoint.
 
 Response:
 
 ```json
 {
-  "message": "solana is great"
+  "message": "Admin authenticated",
+  "token": "<admin_jwt>",
+  "isAdmin": true,
+  "user": {
+    "id": "cm_admin_1",
+    "walletAddress": "9FcnPPxpWC4u3tXPQRx3Bg5kPNVgXhXKoyBeqmF1PRMK",
+    "username": null
+  }
 }
 ```
 
-## API Route Index
+### Step A2: Create two teams
 
-### Exchange and Trading Routes under `/api`
+`POST /api/admin/teams`
 
-- `POST /api/auth/wallet`
+Request:
+
+```json
+{
+  "name": "Team Alpha",
+  "game": "Dota 2",
+  "region": "EU",
+  "logoUrl": "https://cdn.example.com/team-alpha.png"
+}
+```
+
+Response:
+
+```json
+{
+  "message": "Team created",
+  "team": {
+    "id": "cm_team_a",
+    "name": "Team Alpha",
+    "game": "Dota 2",
+    "region": "EU"
+  }
+}
+```
+
+### Step A3: (Optional) Create collection
+
+`POST /api/admin/collections`
+
+Request:
+
+```json
+{
+  "name": "Dota Season 1",
+  "description": "Season bucket",
+  "collectionMint": "<optional mint>",
+  "metadataUri": "<optional uri>"
+}
+```
+
+Response includes `metadataSource: provided|generated|none`.
+
+### Step A4: Mint team asset
+
+`POST /api/admin/assets/mint`
+
+Request (all common fields):
+
+```json
+{
+  "name": "Team Alpha Token",
+  "teamId": "cm_team_a",
+  "collectionId": "cm_collection_1",
+  "totalSupply": 1000,
+  "basePrice": 10,
+  "kFactor": 0.05,
+  "bondingCurveK": 0.05,
+  "volatilityPreset": "MEDIUM"
+}
+```
+
+### Step A5: Mint LAND NFT-style asset
+
+`POST /api/admin/assets/mint/land`
+
+Request:
+
+```json
+{
+  "name": "Arena Parcel A1",
+  "description": "Premium arena land",
+  "location": "Sector-7",
+  "collectionId": "cm_collection_1",
+  "totalSupply": 1,
+  "basePrice": 50,
+  "volatilityPreset": "LOW",
+  "imageBase64": "<optional base64 image>",
+  "metadataUri": "<optional uri override>"
+}
+```
+
+Response:
+
+```json
+{
+  "message": "LAND asset minted",
+  "asset": {
+    "id": "cm_land_1",
+    "assetType": "LAND"
+  },
+  "pricingConfig": {
+    "basePrice": 50,
+    "kFactor": 0.01,
+    "volatilityPreset": "LOW"
+  },
+  "metadataSource": "generated",
+  "mint": {
+    "mintAddress": "...",
+    "treasuryPda": "...",
+    "txSignature": "..."
+  }
+}
+```
+
+### Step A6: Create match
+
+`POST /api/admin/matches`
+
+Request:
+
+```json
+{
+  "teamAId": "cm_team_a",
+  "teamBId": "cm_team_b",
+  "tournament": "Spring Cup",
+  "startTime": "2026-04-05T12:00:00.000Z"
+}
+```
+
+### Step A7: Create market (AMM pool)
+
+`POST /api/admin/markets`
+
+Request:
+
+```json
+{
+  "matchId": "cm_match_1",
+  "basePrice": 1,
+  "kFactor": 0.05,
+  "volatilityPreset": "MEDIUM",
+  "initialLiquidity": 2000
+}
+```
+
+Response includes:
+
+```json
+{
+  "message": "Market created",
+  "marketModel": "AMM_POOL",
+  "pricingConfig": {
+    "basePrice": 1,
+    "kFactor": 0.05,
+    "volatilityPreset": "MEDIUM"
+  }
+}
+```
+
+### Step U1: User sign-in
+
+`POST /api/auth/wallet`
+
+Request:
+
+```json
+{
+  "walletAddress": "<user wallet>",
+  "signature": "<base64 signature of AUTH_SIGN_MESSAGE>"
+}
+```
+
+### Step U2: User reads public market data
+
+- `GET /api/matches`
+- `GET /api/markets`
+- `GET /api/markets/:marketId/audit`
+
+### Step U3: User buys prediction side
+
+1) `POST /api/markets/buy/prepare`
+
+Request:
+
+```json
+{
+  "marketId": "cm_market_1",
+  "side": "TEAM_A",
+  "quantity": 3
+}
+```
+
+Prepare response includes:
+
+```json
+{
+  "unsignedTx": "<base64 tx>",
+  "preview": {
+    "baseCost": 3.1,
+    "totalCost": 3.131,
+    "feeBreakdown": {
+      "feeBps": 100,
+      "feeAmount": 0.031
+    }
+  }
+}
+```
+
+2) Wallet signs + broadcasts tx.
+
+3) `POST /api/markets/buy/confirm`
+
+```json
+{
+  "txSignature": "<solana signature>",
+  "marketId": "cm_market_1",
+  "side": "TEAM_A",
+  "quantity": 3
+}
+```
+
+### Step A8: Admin sets result
+
+`POST /api/admin/matches/result`
+
+Request:
+
+```json
+{
+  "matchId": "cm_match_1",
+  "winner": "TEAM_A"
+}
+```
+
+### Step U4: Winner claims payout
+
+1) `POST /api/markets/claim/prepare`
+
+```json
+{
+  "marketId": "cm_market_1"
+}
+```
+
+Prepare response includes gross/net + fee breakdown.
+
+2) Wallet signs + broadcasts tx.
+
+3) `POST /api/markets/claim/confirm`
+
+```json
+{
+  "txSignature": "<solana signature>",
+  "marketId": "cm_market_1"
+}
+```
+
+Confirm response now includes devnet treasury payout transfer:
+
+```json
+{
+  "message": "Rewards claimed",
+  "payout": 98,
+  "feeBreakdown": {
+    "feeBps": 100,
+    "feeAmount": 1,
+    "grossPayout": 99,
+    "netPayout": 98
+  },
+  "payoutTransfer": {
+    "txSignature": "<devnet transfer tx>",
+    "lamports": 9800000,
+    "solAmount": 0.0098
+  },
+  "transaction": {
+    "txType": "CLAIM_REWARD"
+  }
+}
+```
+
+---
+
+## 5) Endpoint Reference (Ordered)
+
+### Admin setup endpoints
+
 - `POST /api/auth/admin`
 - `POST /api/admin/teams`
 - `POST /api/admin/collections`
 - `POST /api/admin/assets/mint`
+- `POST /api/admin/assets/mint/land`
 - `POST /api/admin/matches`
 - `POST /api/admin/markets`
 - `POST /api/admin/markets/liquidity`
 - `POST /api/admin/matches/result`
-- `GET /api/teams`
-- `GET /api/assets`
+
+### User trading endpoints (prepare/confirm)
+
 - `POST /api/assets/buy/prepare`
 - `POST /api/assets/buy/confirm`
 - `POST /api/assets/sell/prepare`
 - `POST /api/assets/sell/confirm`
-- `GET /api/matches`
-- `GET /api/markets`
 - `POST /api/markets/buy/prepare`
 - `POST /api/markets/buy/confirm`
 - `POST /api/markets/sell/prepare`
 - `POST /api/markets/sell/confirm`
 - `POST /api/markets/claim/prepare`
 - `POST /api/markets/claim/confirm`
+
+### Transparency and audit endpoints
+
+- `GET /api/assets/:assetId/owners`
+- `GET /api/markets/:marketId/audit`
+- `GET /api/admin/assets/:assetId/transactions`
+- `GET /api/admin/assets/:assetId/holders`
+- `GET /api/admin/transactions?txType=BUY_ASSET`
+
+### Public read endpoints
+
+- `GET /api/teams`
+- `GET /api/assets`
+- `GET /api/matches`
+- `GET /api/markets`
 - `GET /api/debug/exchange-state`
 
-### User Routes under `/user`
+---
 
-- `GET /user/by-wallet/:walletAddress`
-- `POST /user/signin`
-- `PUT /user/profile`
-- `GET /user/profile`
+## 6) Fee and Transparency Behavior
 
-## Data Models Returned by the API
+- Platform fee is applied in prepare/confirm responses as `feeBreakdown`.
+- Buys return `baseCost` + fee -> `totalCost`.
+- Sells/claims return `grossPayout` - fee -> `netPayout`.
+- Market audit endpoint exposes pool state, side supply, and recent trades for transparency.
 
-These are the key shapes used in the example responses.
+---
 
-### User
+## 7) Common Error Responses
 
 ```json
-{
-  "id": "cm8user123",
-  "walletAddress": "9xQeWvG816bUx9EPjHmaT23yvVMR9hM1S9h8y5RzV5j",
-  "username": "alphafan",
-  "avatarUrl": null,
-  "country": "India",
-  "bio": "Esports fan and trader",
-  "createdAt": "2026-03-13T10:00:00.000Z"
-}
+{ "message": "Unauthorized" }
 ```
 
-### Team
-
 ```json
-{
-  "id": "cm8team123",
-  "name": "Team Spirit",
-  "game": "Dota 2",
-  "region": "EU",
-  "logoUrl": "https://cdn.example.com/team-spirit.png",
-  "createdAt": "2026-03-13T10:10:00.000Z"
-}
+{ "message": "Admin access required" }
 ```
 
-### Asset Collection
-
 ```json
-{
-  "id": "cm8collection123",
-  "name": "Blue Chip Teams",
-  "description": "Top esports teams collection",
-  "collectionMint": "5FcollectionMint1111111111111111111111111111",
-  "metadataUri": "https://ik.imagekit.io/demo/collections/blue-chip.json",
-  "createdAt": "2026-03-13T10:12:00.000Z"
-}
+{ "message": "Transaction memo does not match request parameters" }
 ```
 
-### Asset
-
 ```json
-{
-  "id": "cm8asset123",
-  "name": "Team Spirit Alpha",
-  "assetType": "TEAM",
-  "teamId": "cm8team123",
-  "collectionId": "cm8collection123",
-  "mintAddress": "8Mint1111111111111111111111111111111111111",
-  "metadataUri": "https://ik.imagekit.io/demo/assets/team-spirit-alpha.json",
-  "basePrice": 5,
-  "currentPrice": 5.4,
-  "totalSupply": 1000,
-  "circulating": 4,
-  "bondingCurveK": 0.1,
-  "createdAt": "2026-03-13T10:15:00.000Z"
-}
+{ "message": "Market is not open" }
 ```
 
-### Match
-
 ```json
-{
-  "id": "cm8match123",
-  "teamAId": "cm8team123",
-  "teamBId": "cm8team456",
-  "tournament": "DreamLeague Season 25",
-  "startTime": "2026-03-20T16:00:00.000Z",
-  "status": "SCHEDULED",
-  "result": null,
-  "createdAt": "2026-03-13T10:20:00.000Z"
-}
-```
-
-### Prediction Market
-
-```json
-{
-  "id": "cm8market123",
-  "matchId": "cm8match123",
-  "contractAddr": "5nTxSig1111111111111111111111111111111111",
-  "liquidityPool": 1000,
-  "supplyA": 10,
-  "supplyB": 8,
-  "basePrice": 1,
-  "curveK": 0.05,
-  "status": "OPEN",
-  "createdAt": "2026-03-13T10:25:00.000Z"
-}
-```
-
-### Transaction
-
-```json
-{
-  "id": "cm8tx123",
-  "userId": "cm8user123",
-  "txType": "BUY_ASSET",
-  "assetId": "cm8asset123",
-  "marketId": null,
-  "quantity": 2,
-  "amountUsdc": 10.1,
-  "txSignature": "3sig11111111111111111111111111111111111111",
-  "createdAt": "2026-03-13T10:30:00.000Z"
-}
+{ "message": "No winning position to claim" }
 ```
 
 ## Exchange Auth Endpoint

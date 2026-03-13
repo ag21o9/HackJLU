@@ -2,7 +2,7 @@ import { Router } from 'express';
 import jwt from 'jsonwebtoken';
 import nacl from 'tweetnacl';
 import bs58 from 'bs58';
-import { Connection, Keypair, PublicKey, SystemProgram, Transaction, TransactionInstruction, clusterApiUrl, sendAndConfirmTransaction, } from '@solana/web3.js';
+import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, TransactionInstruction, clusterApiUrl, sendAndConfirmTransaction, } from '@solana/web3.js';
 import { ASSOCIATED_TOKEN_PROGRAM_ID, MINT_SIZE, TOKEN_PROGRAM_ID, createAssociatedTokenAccountInstruction, createInitializeMintInstruction, createMintToInstruction, createTransferInstruction, getAssociatedTokenAddress, getMinimumBalanceForRentExemptMint, } from '@solana/spl-token';
 import { Prisma, PredictionSide } from '../generated/prisma/client.js';
 import { prisma } from '../prisma.config.js';
@@ -10,6 +10,23 @@ import { uploadFile } from '../config/imageKit.config.js';
 const exchangeRouter = Router();
 const JWT_SECRET = process.env.JWT_SECRET ?? 'hello world';
 const AUTH_MESSAGE = process.env.AUTH_SIGN_MESSAGE ?? 'Sign into mechanical turks';
+const PLATFORM_FEE_BPS = (() => {
+    const parsed = Number(process.env.PLATFORM_FEE_BPS ?? '100');
+    if (!Number.isFinite(parsed) || parsed < 0)
+        return 100;
+    return Math.min(200, Math.max(0, Math.round(parsed)));
+})();
+const CLAIM_SOL_PER_USDC = (() => {
+    const parsed = Number(process.env.CLAIM_SOL_PER_USDC ?? '0.0001');
+    if (!Number.isFinite(parsed) || parsed <= 0)
+        return 0.0001;
+    return parsed;
+})();
+const VOLATILITY_PRESETS = {
+    LOW: 0.01,
+    MEDIUM: 0.05,
+    HIGH: 0.1,
+};
 function getUserIdFromAuthHeader(authHeader) {
     if (!authHeader?.startsWith('Bearer '))
         return null;
@@ -173,6 +190,38 @@ async function uploadCollectionMetadata(params) {
         return null;
     }
 }
+async function uploadLandMetadata(params) {
+    let imageUrl = null;
+    const imageBuffer = parseBase64Image(params.imageBase64);
+    if (imageBuffer) {
+        try {
+            const uploadedImage = await uploadFile(imageBuffer, `${params.name.replace(/\s+/g, '-').toLowerCase()}-land-image.jpg`);
+            imageUrl = uploadedImage.url ?? null;
+        }
+        catch {
+            imageUrl = null;
+        }
+    }
+    const metadata = {
+        name: params.name,
+        symbol: 'ESP-LAND',
+        description: params.description ?? `Land NFT for ${params.name}`,
+        image: imageUrl,
+        attributes: [
+            { trait_type: 'asset_type', value: 'LAND' },
+            { trait_type: 'location', value: params.location ?? 'N/A' },
+            { trait_type: 'base_price', value: params.basePrice },
+            { trait_type: 'k_factor', value: params.kFactor },
+        ],
+    };
+    try {
+        const uploaded = await uploadFile(Buffer.from(JSON.stringify(metadata, null, 2), 'utf8'), `${params.name.replace(/\s+/g, '-').toLowerCase()}-land-metadata.json`);
+        return uploaded.url ?? null;
+    }
+    catch {
+        return null;
+    }
+}
 function toJsonSafe(value) {
     if (typeof value === 'bigint')
         return value.toString();
@@ -200,6 +249,66 @@ function requirePositiveInt(value) {
     if (!parsed)
         return null;
     return Math.trunc(parsed);
+}
+function parseVolatilityPreset(value) {
+    if (typeof value !== 'string')
+        return null;
+    const normalized = value.trim().toUpperCase();
+    if (normalized === 'LOW' || normalized === 'MEDIUM' || normalized === 'HIGH')
+        return normalized;
+    return null;
+}
+function resolveCurveK(params) {
+    const fromPreset = parseVolatilityPreset(params.preset);
+    const parsedExplicit = requirePositiveNumber(params.explicitK);
+    const parsedAlias = requirePositiveNumber(params.aliasK);
+    const resolved = parsedExplicit ?? parsedAlias ?? (fromPreset ? VOLATILITY_PRESETS[fromPreset] : null);
+    if (!resolved)
+        return null;
+    if (resolved < params.min || resolved > params.max)
+        return null;
+    return resolved;
+}
+function computeFeeBreakdown(baseAmount) {
+    const feeAmount = Number(((baseAmount * PLATFORM_FEE_BPS) / 10000).toFixed(6));
+    return {
+        feeBps: PLATFORM_FEE_BPS,
+        feeAmount,
+        grossAmount: Number((baseAmount + feeAmount).toFixed(6)),
+        netAmount: Number((baseAmount - feeAmount).toFixed(6)),
+    };
+}
+function parseBase64Image(input) {
+    if (typeof input !== 'string' || !input.trim())
+        return null;
+    const normalized = input.includes(',') ? input.split(',').pop() ?? '' : input;
+    try {
+        const buffer = Buffer.from(normalized, 'base64');
+        if (!buffer.length)
+            return null;
+        return buffer;
+    }
+    catch {
+        return null;
+    }
+}
+async function sendSolPayoutToUser(walletAddress, payoutUsdc) {
+    const connection = getSolanaConnection();
+    const payer = getPlatformSigner();
+    const recipient = new PublicKey(walletAddress);
+    const solAmount = Number((payoutUsdc * CLAIM_SOL_PER_USDC).toFixed(9));
+    const lamports = Math.max(1, Math.floor(solAmount * LAMPORTS_PER_SOL));
+    const { blockhash } = await connection.getLatestBlockhash('confirmed');
+    const tx = new Transaction({
+        feePayer: payer.publicKey,
+        recentBlockhash: blockhash,
+    }).add(SystemProgram.transfer({
+        fromPubkey: payer.publicKey,
+        toPubkey: recipient,
+        lamports,
+    }));
+    const txSignature = await sendAndConfirmTransaction(connection, tx, [payer], { commitment: 'confirmed' });
+    return { txSignature, lamports, solAmount };
 }
 function priceAt(basePrice, kFactor, supply) {
     return basePrice + (kFactor * supply);
@@ -409,15 +518,21 @@ exchangeRouter.post('/admin/assets/mint', async (req, res) => {
         if (!isAdminRequest({ headers: req.headers }, authWallet)) {
             return res.status(403).json({ message: 'Admin access required' });
         }
-        const { name, teamId, collectionId, totalSupply, basePrice, kFactor } = req.body;
+        const { name, teamId, collectionId, totalSupply, basePrice, kFactor, bondingCurveK, volatilityPreset } = req.body;
         if (typeof name !== 'string' || !name.trim() || typeof teamId !== 'string' || !teamId.trim()) {
             return res.status(400).json({ message: 'name and teamId are required' });
         }
         const supply = requirePositiveInt(totalSupply);
         const parsedBasePrice = requirePositiveNumber(basePrice);
-        const parsedKFactor = requirePositiveNumber(kFactor);
+        const parsedKFactor = resolveCurveK({
+            explicitK: kFactor,
+            aliasK: bondingCurveK,
+            preset: volatilityPreset,
+            min: 0.001,
+            max: 2,
+        });
         if (!supply || !parsedBasePrice || !parsedKFactor) {
-            return res.status(400).json({ message: 'totalSupply, basePrice, kFactor must be positive numbers' });
+            return res.status(400).json({ message: 'totalSupply, basePrice and kFactor/bondingCurveK (or volatilityPreset) are required with valid limits' });
         }
         const [team, collection] = await Promise.all([
             prisma.team.findUnique({ where: { id: teamId.trim() } }),
@@ -460,6 +575,11 @@ exchangeRouter.post('/admin/assets/mint', async (req, res) => {
         return res.status(201).json({
             message: 'Asset minted',
             asset,
+            pricingConfig: {
+                basePrice: parsedBasePrice,
+                kFactor: parsedKFactor,
+                volatilityPreset: parseVolatilityPreset(volatilityPreset),
+            },
             mint: {
                 mintAddress,
                 treasuryPda,
@@ -470,6 +590,85 @@ exchangeRouter.post('/admin/assets/mint', async (req, res) => {
     catch (error) {
         console.log(error);
         return res.status(500).json({ message: error.message || 'Failed to mint asset' });
+    }
+});
+exchangeRouter.post('/admin/assets/mint/land', async (req, res) => {
+    try {
+        const authUser = await getUserFromAuthHeader(req.headers.authorization);
+        const authWallet = authUser?.walletAddress;
+        if (!isAdminRequest({ headers: req.headers }, authWallet)) {
+            return res.status(403).json({ message: 'Admin access required' });
+        }
+        const { name, description, location, collectionId, totalSupply, basePrice, kFactor, bondingCurveK, volatilityPreset, metadataUri, imageBase64, } = req.body;
+        if (typeof name !== 'string' || !name.trim()) {
+            return res.status(400).json({ message: 'name is required' });
+        }
+        const supply = requirePositiveInt(totalSupply ?? 1);
+        const parsedBasePrice = requirePositiveNumber(basePrice);
+        const parsedKFactor = resolveCurveK({
+            explicitK: kFactor,
+            aliasK: bondingCurveK,
+            preset: volatilityPreset,
+            min: 0.001,
+            max: 2,
+        });
+        if (!supply || !parsedBasePrice || !parsedKFactor) {
+            return res.status(400).json({ message: 'totalSupply, basePrice and kFactor/bondingCurveK (or volatilityPreset) are required with valid limits' });
+        }
+        const collection = typeof collectionId === 'string' && collectionId.trim()
+            ? await prisma.assetCollection.findUnique({ where: { id: collectionId.trim() } })
+            : null;
+        if (collectionId && !collection)
+            return res.status(404).json({ message: 'Collection not found' });
+        const mintOwner = process.env.ADMIN_MINT_WALLET ?? getPlatformSigner().publicKey.toBase58();
+        const { mintAddress, treasuryPda, txSignature } = await mintAssetToken({
+            ownerWallet: mintOwner,
+            totalSupply: supply,
+        });
+        const resolvedMetadataUri = typeof metadataUri === 'string' && metadataUri.trim()
+            ? metadataUri.trim()
+            : await uploadLandMetadata({
+                name: name.trim(),
+                ...(typeof description === 'string' && description.trim() ? { description: description.trim() } : {}),
+                ...(typeof location === 'string' && location.trim() ? { location: location.trim() } : {}),
+                basePrice: parsedBasePrice,
+                kFactor: parsedKFactor,
+                imageBase64,
+            });
+        const asset = await prisma.asset.create({
+            data: {
+                name: name.trim(),
+                assetType: 'LAND',
+                teamId: null,
+                collectionId: collection?.id ?? null,
+                mintAddress,
+                metadataUri: resolvedMetadataUri,
+                basePrice: parsedBasePrice,
+                currentPrice: priceAt(parsedBasePrice, parsedKFactor, 0),
+                totalSupply: supply,
+                circulating: 0,
+                bondingCurveK: parsedKFactor,
+            },
+        });
+        return res.status(201).json({
+            message: 'LAND asset minted',
+            asset,
+            pricingConfig: {
+                basePrice: parsedBasePrice,
+                kFactor: parsedKFactor,
+                volatilityPreset: parseVolatilityPreset(volatilityPreset),
+            },
+            metadataSource: typeof metadataUri === 'string' && metadataUri.trim() ? 'provided' : resolvedMetadataUri ? 'generated' : 'none',
+            mint: {
+                mintAddress,
+                treasuryPda,
+                txSignature,
+            },
+        });
+    }
+    catch (error) {
+        console.log(error);
+        return res.status(500).json({ message: error.message || 'Failed to mint LAND asset' });
     }
 });
 exchangeRouter.post('/admin/matches', async (req, res) => {
@@ -524,12 +723,17 @@ exchangeRouter.post('/admin/markets', async (req, res) => {
         if (!isAdminRequest({ headers: req.headers }, authWallet)) {
             return res.status(403).json({ message: 'Admin access required' });
         }
-        const { matchId, basePrice, kFactor, initialLiquidity } = req.body;
+        const { matchId, basePrice, kFactor, volatilityPreset, initialLiquidity } = req.body;
         if (typeof matchId !== 'string' || !matchId.trim()) {
             return res.status(400).json({ message: 'matchId is required' });
         }
         const parsedBasePrice = requirePositiveNumber(basePrice);
-        const parsedKFactor = requirePositiveNumber(kFactor);
+        const parsedKFactor = resolveCurveK({
+            explicitK: kFactor,
+            preset: volatilityPreset,
+            min: 0.001,
+            max: 2,
+        });
         const parsedLiquidity = requirePositiveNumber(initialLiquidity);
         if (!parsedBasePrice || !parsedKFactor || !parsedLiquidity) {
             return res.status(400).json({ message: 'basePrice, kFactor, initialLiquidity must be positive numbers' });
@@ -564,6 +768,12 @@ exchangeRouter.post('/admin/markets', async (req, res) => {
         });
         return res.status(201).json({
             message: 'Market created',
+            marketModel: 'AMM_POOL',
+            pricingConfig: {
+                basePrice: parsedBasePrice,
+                kFactor: parsedKFactor,
+                volatilityPreset: parseVolatilityPreset(volatilityPreset),
+            },
             contractCall: {
                 method: 'create_market',
                 txSignature: createMarketSig,
@@ -692,6 +902,47 @@ exchangeRouter.get('/assets', async (_req, res) => {
         return res.status(500).json({ message: 'Failed to fetch assets' });
     }
 });
+exchangeRouter.get('/assets/:assetId/owners', async (req, res) => {
+    try {
+        const assetId = typeof req.params.assetId === 'string' ? req.params.assetId.trim() : '';
+        if (!assetId)
+            return res.status(400).json({ message: 'assetId is required' });
+        const asset = await prisma.asset.findUnique({ where: { id: assetId } });
+        if (!asset)
+            return res.status(404).json({ message: 'Asset not found' });
+        const holders = await prisma.userAsset.findMany({
+            where: { assetId },
+            include: {
+                user: {
+                    select: {
+                        id: true,
+                        walletAddress: true,
+                        username: true,
+                    },
+                },
+            },
+            orderBy: [{ quantity: 'desc' }, { createdAt: 'asc' }],
+        });
+        const totalHeld = holders.reduce((sum, row) => sum + row.quantity, 0);
+        return res.json(toJsonSafe({
+            message: 'Asset owners fetched',
+            asset: {
+                id: asset.id,
+                name: asset.name,
+                assetType: asset.assetType,
+                circulating: asset.circulating,
+                totalSupply: asset.totalSupply,
+            },
+            holdersCount: holders.length,
+            totalHeld,
+            data: holders,
+        }));
+    }
+    catch (error) {
+        console.log(error);
+        return res.status(500).json({ message: 'Failed to fetch asset owners' });
+    }
+});
 exchangeRouter.post('/assets/buy/prepare', async (req, res) => {
     try {
         const user = await getUserFromAuthHeader(req.headers.authorization);
@@ -711,7 +962,9 @@ exchangeRouter.post('/assets/buy/prepare', async (req, res) => {
         if ((asset.circulating + parsedQuantity) > asset.totalSupply) {
             return res.status(400).json({ message: 'Requested quantity exceeds remaining supply' });
         }
-        const cost = buyCost(asset.basePrice, asset.bondingCurveK, asset.circulating, parsedQuantity);
+        const baseCost = buyCost(asset.basePrice, asset.bondingCurveK, asset.circulating, parsedQuantity);
+        const fee = computeFeeBreakdown(baseCost);
+        const totalCost = fee.grossAmount;
         const connection = getSolanaConnection();
         const payer = getPlatformSigner();
         const mint = new PublicKey(asset.mintAddress);
@@ -729,12 +982,30 @@ exchangeRouter.post('/assets/buy/prepare', async (req, res) => {
         tx.add(new TransactionInstruction({
             programId: MEMO_PROGRAM_ID,
             keys: [{ pubkey: userWallet, isSigner: true, isWritable: false }],
-            data: Buffer.from(JSON.stringify({ op: 'buy_asset', assetId: asset.id, quantity: parsedQuantity, cost }), 'utf8'),
+            data: Buffer.from(JSON.stringify({
+                op: 'buy_asset',
+                assetId: asset.id,
+                quantity: parsedQuantity,
+                baseCost,
+                feeAmount: fee.feeAmount,
+                totalCost,
+            }), 'utf8'),
         }));
         tx.partialSign(payer);
         return res.json({
             unsignedTx: tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString('base64'),
-            preview: { assetId: asset.id, assetName: asset.name, quantity: parsedQuantity, cost, currentPrice: priceAt(asset.basePrice, asset.bondingCurveK, asset.circulating) },
+            preview: {
+                assetId: asset.id,
+                assetName: asset.name,
+                quantity: parsedQuantity,
+                baseCost,
+                totalCost,
+                feeBreakdown: {
+                    feeBps: fee.feeBps,
+                    feeAmount: fee.feeAmount,
+                },
+                currentPrice: priceAt(asset.basePrice, asset.bondingCurveK, asset.circulating),
+            },
         });
     }
     catch (error) {
@@ -761,7 +1032,14 @@ exchangeRouter.post('/assets/buy/confirm', async (req, res) => {
         if (memo.op !== 'buy_asset' || memo.assetId !== assetId.trim() || Number(memo.quantity) !== parsedQuantity) {
             return res.status(400).json({ message: 'Transaction memo does not match request parameters' });
         }
-        const cost = typeof memo.cost === 'number' ? memo.cost : Number(memo.cost);
+        const totalCost = typeof memo.totalCost === 'number' ? memo.totalCost : Number(memo.totalCost);
+        const feeAmount = typeof memo.feeAmount === 'number' ? memo.feeAmount : Number(memo.feeAmount);
+        const baseCost = typeof memo.baseCost === 'number' ? memo.baseCost : Number(memo.baseCost);
+        const resolvedTotalCost = Number.isFinite(totalCost)
+            ? totalCost
+            : (typeof memo.cost === 'number' ? memo.cost : Number(memo.cost));
+        const resolvedFeeAmount = Number.isFinite(feeAmount) ? feeAmount : computeFeeBreakdown(resolvedTotalCost).feeAmount;
+        const resolvedBaseCost = Number.isFinite(baseCost) ? baseCost : Number((resolvedTotalCost - resolvedFeeAmount).toFixed(6));
         const existingTx = await prisma.transaction.findFirst({ where: { txSignature: txSignature.trim(), userId: user.id } });
         if (existingTx)
             return res.json({ message: 'Already confirmed', transaction: existingTx });
@@ -777,18 +1055,29 @@ exchangeRouter.post('/assets/buy/confirm', async (req, res) => {
             const existingHolding = await tx.userAsset.findUnique({ where: { userId_assetId: { userId: user.id, assetId: asset.id } } });
             if (existingHolding) {
                 const nextQty = existingHolding.quantity + parsedQuantity;
-                const nextAvg = ((existingHolding.avgPrice * existingHolding.quantity) + cost) / nextQty;
+                const nextAvg = ((existingHolding.avgPrice * existingHolding.quantity) + resolvedTotalCost) / nextQty;
                 await tx.userAsset.update({ where: { id: existingHolding.id }, data: { quantity: nextQty, avgPrice: nextAvg } });
             }
             else {
-                await tx.userAsset.create({ data: { userId: user.id, assetId: asset.id, quantity: parsedQuantity, avgPrice: cost / parsedQuantity } });
+                await tx.userAsset.create({ data: { userId: user.id, assetId: asset.id, quantity: parsedQuantity, avgPrice: resolvedTotalCost / parsedQuantity } });
             }
             const transaction = await tx.transaction.create({
-                data: { userId: user.id, txType: 'BUY_ASSET', assetId: asset.id, quantity: parsedQuantity, amountUsdc: cost, txSignature: txSignature.trim() },
+                data: { userId: user.id, txType: 'BUY_ASSET', assetId: asset.id, quantity: parsedQuantity, amountUsdc: resolvedTotalCost, txSignature: txSignature.trim() },
             });
-            return { updatedAsset, cost, transaction };
+            return { updatedAsset, totalCost: resolvedTotalCost, baseCost: resolvedBaseCost, feeAmount: resolvedFeeAmount, transaction };
         });
-        return res.json({ message: 'Asset buy confirmed', asset: result.updatedAsset, quantity: parsedQuantity, totalCost: result.cost, transaction: result.transaction });
+        return res.json({
+            message: 'Asset buy confirmed',
+            asset: result.updatedAsset,
+            quantity: parsedQuantity,
+            totalCost: result.totalCost,
+            feeBreakdown: {
+                feeBps: PLATFORM_FEE_BPS,
+                feeAmount: result.feeAmount,
+                baseCost: result.baseCost,
+            },
+            transaction: result.transaction,
+        });
     }
     catch (error) {
         console.log(error);
@@ -814,7 +1103,9 @@ exchangeRouter.post('/assets/sell/prepare', async (req, res) => {
         const holding = await prisma.userAsset.findUnique({ where: { userId_assetId: { userId: user.id, assetId: asset.id } } });
         if (!holding || holding.quantity < parsedQuantity)
             return res.status(400).json({ message: 'Insufficient asset quantity' });
-        const payout = sellPayout(asset.basePrice, asset.bondingCurveK, asset.circulating, parsedQuantity);
+        const grossPayout = sellPayout(asset.basePrice, asset.bondingCurveK, asset.circulating, parsedQuantity);
+        const fee = computeFeeBreakdown(grossPayout);
+        const netPayout = fee.netAmount;
         const connection = getSolanaConnection();
         const payer = getPlatformSigner();
         const mint = new PublicKey(asset.mintAddress);
@@ -828,13 +1119,31 @@ exchangeRouter.post('/assets/sell/prepare', async (req, res) => {
         tx.add(new TransactionInstruction({
             programId: MEMO_PROGRAM_ID,
             keys: [{ pubkey: userWallet, isSigner: true, isWritable: false }],
-            data: Buffer.from(JSON.stringify({ op: 'sell_asset', assetId: asset.id, quantity: parsedQuantity, payout }), 'utf8'),
+            data: Buffer.from(JSON.stringify({
+                op: 'sell_asset',
+                assetId: asset.id,
+                quantity: parsedQuantity,
+                grossPayout,
+                feeAmount: fee.feeAmount,
+                netPayout,
+            }), 'utf8'),
         }));
         // Platform signs only as fee payer; user must sign as token transfer authority + memo
         tx.partialSign(payer);
         return res.json({
             unsignedTx: tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString('base64'),
-            preview: { assetId: asset.id, assetName: asset.name, quantity: parsedQuantity, payout, currentPrice: priceAt(asset.basePrice, asset.bondingCurveK, asset.circulating) },
+            preview: {
+                assetId: asset.id,
+                assetName: asset.name,
+                quantity: parsedQuantity,
+                grossPayout,
+                netPayout,
+                feeBreakdown: {
+                    feeBps: fee.feeBps,
+                    feeAmount: fee.feeAmount,
+                },
+                currentPrice: priceAt(asset.basePrice, asset.bondingCurveK, asset.circulating),
+            },
         });
     }
     catch (error) {
@@ -861,7 +1170,14 @@ exchangeRouter.post('/assets/sell/confirm', async (req, res) => {
         if (memo.op !== 'sell_asset' || memo.assetId !== assetId.trim() || Number(memo.quantity) !== parsedQuantity) {
             return res.status(400).json({ message: 'Transaction memo does not match request parameters' });
         }
-        const payout = typeof memo.payout === 'number' ? memo.payout : Number(memo.payout);
+        const netPayout = typeof memo.netPayout === 'number' ? memo.netPayout : Number(memo.netPayout);
+        const feeAmount = typeof memo.feeAmount === 'number' ? memo.feeAmount : Number(memo.feeAmount);
+        const grossPayout = typeof memo.grossPayout === 'number' ? memo.grossPayout : Number(memo.grossPayout);
+        const resolvedNetPayout = Number.isFinite(netPayout)
+            ? netPayout
+            : (typeof memo.payout === 'number' ? memo.payout : Number(memo.payout));
+        const resolvedFeeAmount = Number.isFinite(feeAmount) ? feeAmount : computeFeeBreakdown(resolvedNetPayout).feeAmount;
+        const resolvedGrossPayout = Number.isFinite(grossPayout) ? grossPayout : Number((resolvedNetPayout + resolvedFeeAmount).toFixed(6));
         const existingTx = await prisma.transaction.findFirst({ where: { txSignature: txSignature.trim(), userId: user.id } });
         if (existingTx)
             return res.json({ message: 'Already confirmed', transaction: existingTx });
@@ -885,11 +1201,23 @@ exchangeRouter.post('/assets/sell/confirm', async (req, res) => {
                 await tx.userAsset.update({ where: { id: holding.id }, data: { quantity: nextQty } });
             }
             const transaction = await tx.transaction.create({
-                data: { userId: user.id, txType: 'SELL_ASSET', assetId: asset.id, quantity: parsedQuantity, amountUsdc: payout, txSignature: txSignature.trim() },
+                data: { userId: user.id, txType: 'SELL_ASSET', assetId: asset.id, quantity: parsedQuantity, amountUsdc: resolvedNetPayout, txSignature: txSignature.trim() },
             });
-            return { updatedAsset, payout, transaction };
+            return { updatedAsset, netPayout: resolvedNetPayout, grossPayout: resolvedGrossPayout, feeAmount: resolvedFeeAmount, transaction };
         });
-        return res.json({ message: 'Asset sell confirmed', asset: result.updatedAsset, quantity: parsedQuantity, totalPayout: result.payout, transaction: result.transaction });
+        return res.json({
+            message: 'Asset sell confirmed',
+            asset: result.updatedAsset,
+            quantity: parsedQuantity,
+            totalPayout: result.netPayout,
+            feeBreakdown: {
+                feeBps: PLATFORM_FEE_BPS,
+                feeAmount: result.feeAmount,
+                grossPayout: result.grossPayout,
+                netPayout: result.netPayout,
+            },
+            transaction: result.transaction,
+        });
     }
     catch (error) {
         console.log(error);
@@ -942,6 +1270,78 @@ exchangeRouter.get('/markets', async (_req, res) => {
         return res.status(500).json({ message: 'Failed to fetch markets' });
     }
 });
+exchangeRouter.get('/markets/:marketId/audit', async (req, res) => {
+    try {
+        const marketId = typeof req.params.marketId === 'string' ? req.params.marketId.trim() : '';
+        if (!marketId)
+            return res.status(400).json({ message: 'marketId is required' });
+        const market = await prisma.predictionMarket.findUnique({
+            where: { id: marketId },
+            include: {
+                match: {
+                    include: {
+                        teamA: true,
+                        teamB: true,
+                    },
+                },
+            },
+        });
+        if (!market)
+            return res.status(404).json({ message: 'Market not found' });
+        const recentTrades = await prisma.transaction.findMany({
+            where: {
+                marketId: market.id,
+                txType: {
+                    in: ['BUY_PREDICTION', 'SELL_PREDICTION', 'CLAIM_REWARD'],
+                },
+            },
+            include: {
+                user: {
+                    select: {
+                        id: true,
+                        walletAddress: true,
+                        username: true,
+                    },
+                },
+            },
+            orderBy: { createdAt: 'desc' },
+            take: 25,
+        });
+        const settlementTx = market.status === 'SETTLED'
+            ? await prisma.transaction.findFirst({
+                where: {
+                    marketId: market.id,
+                    txType: 'CLAIM_REWARD',
+                },
+                orderBy: { createdAt: 'asc' },
+            })
+            : null;
+        return res.json(toJsonSafe({
+            message: 'Market audit fetched',
+            marketModel: 'AMM_POOL_P2P',
+            feeModel: {
+                feeBps: PLATFORM_FEE_BPS,
+            },
+            market: {
+                ...market,
+                teamAPrice: marketSidePrice(market.basePrice, market.curveK, market.supplyA),
+                teamBPrice: marketSidePrice(market.basePrice, market.curveK, market.supplyB),
+            },
+            transparency: {
+                poolLiquidity: market.liquidityPool,
+                supplyA: market.supplyA,
+                supplyB: market.supplyB,
+                recentTradesCount: recentTrades.length,
+            },
+            settlement: settlementTx,
+            recentTrades,
+        }));
+    }
+    catch (error) {
+        console.log(error);
+        return res.status(500).json({ message: 'Failed to fetch market audit' });
+    }
+});
 exchangeRouter.post('/markets/buy/prepare', async (req, res) => {
     try {
         const user = await getUserFromAuthHeader(req.headers.authorization);
@@ -964,7 +1364,9 @@ exchangeRouter.post('/markets/buy/prepare', async (req, res) => {
         if (market.status !== 'OPEN')
             return res.status(400).json({ message: 'Market is not open' });
         const sideSupply = side === 'TEAM_A' ? market.supplyA : market.supplyB;
-        const cost = marketBuyCost(market.basePrice, market.curveK, sideSupply, parsedQuantity);
+        const baseCost = marketBuyCost(market.basePrice, market.curveK, sideSupply, parsedQuantity);
+        const fee = computeFeeBreakdown(baseCost);
+        const totalCost = fee.grossAmount;
         const payer = getPlatformSigner();
         const userWallet = new PublicKey(user.walletAddress);
         const { blockhash } = await getSolanaConnection().getLatestBlockhash('confirmed');
@@ -973,12 +1375,32 @@ exchangeRouter.post('/markets/buy/prepare', async (req, res) => {
         tx.add(new TransactionInstruction({
             programId: MEMO_PROGRAM_ID,
             keys: [{ pubkey: userWallet, isSigner: true, isWritable: false }],
-            data: Buffer.from(JSON.stringify({ op: 'buy_prediction', marketId: market.id, side, quantity: parsedQuantity, cost }), 'utf8'),
+            data: Buffer.from(JSON.stringify({
+                op: 'buy_prediction',
+                marketId: market.id,
+                side,
+                quantity: parsedQuantity,
+                baseCost,
+                feeAmount: fee.feeAmount,
+                totalCost,
+            }), 'utf8'),
         }));
         tx.partialSign(payer);
         return res.json({
             unsignedTx: tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString('base64'),
-            preview: { marketId: market.id, side, quantity: parsedQuantity, cost, teamAName: market.match.teamA.name, teamBName: market.match.teamB.name },
+            preview: {
+                marketId: market.id,
+                side,
+                quantity: parsedQuantity,
+                baseCost,
+                totalCost,
+                feeBreakdown: {
+                    feeBps: fee.feeBps,
+                    feeAmount: fee.feeAmount,
+                },
+                teamAName: market.match.teamA.name,
+                teamBName: market.match.teamB.name,
+            },
         });
     }
     catch (error) {
@@ -1007,7 +1429,14 @@ exchangeRouter.post('/markets/buy/confirm', async (req, res) => {
         if (memo.op !== 'buy_prediction' || memo.marketId !== marketId.trim() || memo.side !== side || Number(memo.quantity) !== parsedQuantity) {
             return res.status(400).json({ message: 'Transaction memo does not match request parameters' });
         }
-        const cost = typeof memo.cost === 'number' ? memo.cost : Number(memo.cost);
+        const totalCost = typeof memo.totalCost === 'number' ? memo.totalCost : Number(memo.totalCost);
+        const feeAmount = typeof memo.feeAmount === 'number' ? memo.feeAmount : Number(memo.feeAmount);
+        const baseCost = typeof memo.baseCost === 'number' ? memo.baseCost : Number(memo.baseCost);
+        const resolvedTotalCost = Number.isFinite(totalCost)
+            ? totalCost
+            : (typeof memo.cost === 'number' ? memo.cost : Number(memo.cost));
+        const resolvedFeeAmount = Number.isFinite(feeAmount) ? feeAmount : computeFeeBreakdown(resolvedTotalCost).feeAmount;
+        const resolvedBaseCost = Number.isFinite(baseCost) ? baseCost : Number((resolvedTotalCost - resolvedFeeAmount).toFixed(6));
         const existingTx = await prisma.transaction.findFirst({ where: { txSignature: txSignature.trim(), userId: user.id } });
         if (existingTx)
             return res.json({ message: 'Already confirmed', transaction: existingTx });
@@ -1020,26 +1449,37 @@ exchangeRouter.post('/markets/buy/confirm', async (req, res) => {
             const updatedMarket = await tx.predictionMarket.update({
                 where: { id: market.id },
                 data: side === 'TEAM_A'
-                    ? { supplyA: { increment: parsedQuantity }, liquidityPool: { increment: cost } }
-                    : { supplyB: { increment: parsedQuantity }, liquidityPool: { increment: cost } },
+                    ? { supplyA: { increment: parsedQuantity }, liquidityPool: { increment: resolvedBaseCost } }
+                    : { supplyB: { increment: parsedQuantity }, liquidityPool: { increment: resolvedBaseCost } },
             });
             const existing = await tx.predictionPosition.findFirst({ where: { userId: user.id, marketId: market.id, team: side } });
             if (existing) {
                 const nextAmount = existing.amount + parsedQuantity;
-                const nextAvg = ((existing.avgPrice * existing.amount) + cost) / nextAmount;
+                const nextAvg = ((existing.avgPrice * existing.amount) + resolvedTotalCost) / nextAmount;
                 await tx.predictionPosition.update({ where: { id: existing.id }, data: { amount: nextAmount, avgPrice: nextAvg } });
             }
             else {
                 await tx.predictionPosition.create({
-                    data: { userId: user.id, marketId: market.id, team: side, amount: parsedQuantity, avgPrice: cost / parsedQuantity },
+                    data: { userId: user.id, marketId: market.id, team: side, amount: parsedQuantity, avgPrice: resolvedTotalCost / parsedQuantity },
                 });
             }
             const transaction = await tx.transaction.create({
-                data: { userId: user.id, txType: 'BUY_PREDICTION', marketId: market.id, quantity: parsedQuantity, amountUsdc: cost, txSignature: txSignature.trim() },
+                data: { userId: user.id, txType: 'BUY_PREDICTION', marketId: market.id, quantity: parsedQuantity, amountUsdc: resolvedTotalCost, txSignature: txSignature.trim() },
             });
-            return { updatedMarket, cost, transaction };
+            return { updatedMarket, totalCost: resolvedTotalCost, baseCost: resolvedBaseCost, feeAmount: resolvedFeeAmount, transaction };
         });
-        return res.json({ message: 'Prediction buy confirmed', market: result.updatedMarket, quantity: parsedQuantity, totalCost: result.cost, transaction: result.transaction });
+        return res.json({
+            message: 'Prediction buy confirmed',
+            market: result.updatedMarket,
+            quantity: parsedQuantity,
+            totalCost: result.totalCost,
+            feeBreakdown: {
+                feeBps: PLATFORM_FEE_BPS,
+                feeAmount: result.feeAmount,
+                baseCost: result.baseCost,
+            },
+            transaction: result.transaction,
+        });
     }
     catch (error) {
         console.log(error);
@@ -1071,7 +1511,9 @@ exchangeRouter.post('/markets/sell/prepare', async (req, res) => {
         if (!position || position.amount < parsedQuantity)
             return res.status(400).json({ message: 'Insufficient prediction position' });
         const sideSupply = side === 'TEAM_A' ? market.supplyA : market.supplyB;
-        const payout = marketSellPayout(market.basePrice, market.curveK, sideSupply, parsedQuantity);
+        const grossPayout = marketSellPayout(market.basePrice, market.curveK, sideSupply, parsedQuantity);
+        const fee = computeFeeBreakdown(grossPayout);
+        const netPayout = fee.netAmount;
         const payer = getPlatformSigner();
         const userWallet = new PublicKey(user.walletAddress);
         const { blockhash } = await getSolanaConnection().getLatestBlockhash('confirmed');
@@ -1079,12 +1521,32 @@ exchangeRouter.post('/markets/sell/prepare', async (req, res) => {
         tx.add(new TransactionInstruction({
             programId: MEMO_PROGRAM_ID,
             keys: [{ pubkey: userWallet, isSigner: true, isWritable: false }],
-            data: Buffer.from(JSON.stringify({ op: 'sell_prediction', marketId: market.id, side, quantity: parsedQuantity, payout }), 'utf8'),
+            data: Buffer.from(JSON.stringify({
+                op: 'sell_prediction',
+                marketId: market.id,
+                side,
+                quantity: parsedQuantity,
+                grossPayout,
+                feeAmount: fee.feeAmount,
+                netPayout,
+            }), 'utf8'),
         }));
         tx.partialSign(payer);
         return res.json({
             unsignedTx: tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString('base64'),
-            preview: { marketId: market.id, side, quantity: parsedQuantity, payout, teamAName: market.match.teamA.name, teamBName: market.match.teamB.name },
+            preview: {
+                marketId: market.id,
+                side,
+                quantity: parsedQuantity,
+                grossPayout,
+                netPayout,
+                feeBreakdown: {
+                    feeBps: fee.feeBps,
+                    feeAmount: fee.feeAmount,
+                },
+                teamAName: market.match.teamA.name,
+                teamBName: market.match.teamB.name,
+            },
         });
     }
     catch (error) {
@@ -1113,7 +1575,14 @@ exchangeRouter.post('/markets/sell/confirm', async (req, res) => {
         if (memo.op !== 'sell_prediction' || memo.marketId !== marketId.trim() || memo.side !== side || Number(memo.quantity) !== parsedQuantity) {
             return res.status(400).json({ message: 'Transaction memo does not match request parameters' });
         }
-        const payout = typeof memo.payout === 'number' ? memo.payout : Number(memo.payout);
+        const netPayout = typeof memo.netPayout === 'number' ? memo.netPayout : Number(memo.netPayout);
+        const feeAmount = typeof memo.feeAmount === 'number' ? memo.feeAmount : Number(memo.feeAmount);
+        const grossPayout = typeof memo.grossPayout === 'number' ? memo.grossPayout : Number(memo.grossPayout);
+        const resolvedNetPayout = Number.isFinite(netPayout)
+            ? netPayout
+            : (typeof memo.payout === 'number' ? memo.payout : Number(memo.payout));
+        const resolvedFeeAmount = Number.isFinite(feeAmount) ? feeAmount : computeFeeBreakdown(resolvedNetPayout).feeAmount;
+        const resolvedGrossPayout = Number.isFinite(grossPayout) ? grossPayout : Number((resolvedNetPayout + resolvedFeeAmount).toFixed(6));
         const existingTx = await prisma.transaction.findFirst({ where: { txSignature: txSignature.trim(), userId: user.id } });
         if (existingTx)
             return res.json({ message: 'Already confirmed', transaction: existingTx });
@@ -1129,13 +1598,13 @@ exchangeRouter.post('/markets/sell/confirm', async (req, res) => {
             const sideSupply = side === 'TEAM_A' ? market.supplyA : market.supplyB;
             if (sideSupply < parsedQuantity)
                 throw new Error('Invalid market side supply state');
-            if (market.liquidityPool < payout)
+            if (market.liquidityPool < resolvedGrossPayout)
                 throw new Error('Insufficient market liquidity');
             const updatedMarket = await tx.predictionMarket.update({
                 where: { id: market.id },
                 data: side === 'TEAM_A'
-                    ? { supplyA: { decrement: parsedQuantity }, liquidityPool: { decrement: payout } }
-                    : { supplyB: { decrement: parsedQuantity }, liquidityPool: { decrement: payout } },
+                    ? { supplyA: { decrement: parsedQuantity }, liquidityPool: { decrement: resolvedGrossPayout } }
+                    : { supplyB: { decrement: parsedQuantity }, liquidityPool: { decrement: resolvedGrossPayout } },
             });
             const nextAmount = position.amount - parsedQuantity;
             if (nextAmount === 0) {
@@ -1145,11 +1614,23 @@ exchangeRouter.post('/markets/sell/confirm', async (req, res) => {
                 await tx.predictionPosition.update({ where: { id: position.id }, data: { amount: nextAmount } });
             }
             const transaction = await tx.transaction.create({
-                data: { userId: user.id, txType: 'SELL_PREDICTION', marketId: market.id, quantity: parsedQuantity, amountUsdc: payout, txSignature: txSignature.trim() },
+                data: { userId: user.id, txType: 'SELL_PREDICTION', marketId: market.id, quantity: parsedQuantity, amountUsdc: resolvedNetPayout, txSignature: txSignature.trim() },
             });
-            return { updatedMarket, payout, transaction };
+            return { updatedMarket, netPayout: resolvedNetPayout, grossPayout: resolvedGrossPayout, feeAmount: resolvedFeeAmount, transaction };
         });
-        return res.json({ message: 'Prediction sell confirmed', market: result.updatedMarket, quantity: parsedQuantity, totalPayout: result.payout, transaction: result.transaction });
+        return res.json({
+            message: 'Prediction sell confirmed',
+            market: result.updatedMarket,
+            quantity: parsedQuantity,
+            totalPayout: result.netPayout,
+            feeBreakdown: {
+                feeBps: PLATFORM_FEE_BPS,
+                feeAmount: result.feeAmount,
+                grossPayout: result.grossPayout,
+                netPayout: result.netPayout,
+            },
+            transaction: result.transaction,
+        });
     }
     catch (error) {
         console.log(error);
@@ -1185,7 +1666,9 @@ exchangeRouter.post('/markets/claim/prepare', async (req, res) => {
         const myWinningAmount = winningPositions.reduce((acc, p) => acc + p.amount, 0);
         if (myWinningAmount <= 0)
             return res.status(400).json({ message: 'No winning position to claim' });
-        const payout = (market.liquidityPool * myWinningAmount) / winnerSupply;
+        const grossPayout = (market.liquidityPool * myWinningAmount) / winnerSupply;
+        const fee = computeFeeBreakdown(grossPayout);
+        const netPayout = fee.netAmount;
         const payer = getPlatformSigner();
         const userWallet = new PublicKey(user.walletAddress);
         const { blockhash } = await getSolanaConnection().getLatestBlockhash('confirmed');
@@ -1193,12 +1676,31 @@ exchangeRouter.post('/markets/claim/prepare', async (req, res) => {
         tx.add(new TransactionInstruction({
             programId: MEMO_PROGRAM_ID,
             keys: [{ pubkey: userWallet, isSigner: true, isWritable: false }],
-            data: Buffer.from(JSON.stringify({ op: 'claim_reward', marketId: market.id, payout, winningAmount: myWinningAmount }), 'utf8'),
+            data: Buffer.from(JSON.stringify({
+                op: 'claim_reward',
+                marketId: market.id,
+                grossPayout,
+                feeAmount: fee.feeAmount,
+                netPayout,
+                winningAmount: myWinningAmount,
+            }), 'utf8'),
         }));
         tx.partialSign(payer);
         return res.json({
             unsignedTx: tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString('base64'),
-            preview: { marketId: market.id, winningSide, winningAmount: myWinningAmount, payout, teamAName: market.match.teamA.name, teamBName: market.match.teamB.name },
+            preview: {
+                marketId: market.id,
+                winningSide,
+                winningAmount: myWinningAmount,
+                grossPayout,
+                netPayout,
+                feeBreakdown: {
+                    feeBps: fee.feeBps,
+                    feeAmount: fee.feeAmount,
+                },
+                teamAName: market.match.teamA.name,
+                teamBName: market.match.teamB.name,
+            },
         });
     }
     catch (error) {
@@ -1234,8 +1736,15 @@ exchangeRouter.post('/markets/claim/confirm', async (req, res) => {
             if (market.match.result !== 'TEAM_A' && market.match.result !== 'TEAM_B')
                 throw new Error('Match result not available');
             const alreadyClaimed = await tx.transaction.findFirst({ where: { userId: user.id, marketId: market.id, txType: 'CLAIM_REWARD' } });
-            if (alreadyClaimed)
-                return { payout: 0, transaction: alreadyClaimed, alreadyClaimed: true };
+            if (alreadyClaimed) {
+                return {
+                    grossPayout: 0,
+                    netPayout: 0,
+                    feeAmount: 0,
+                    transaction: alreadyClaimed,
+                    alreadyClaimed: true,
+                };
+            }
             const winningSide = market.match.result;
             const winnerSupply = winningSide === 'TEAM_A' ? market.supplyA : market.supplyB;
             if (winnerSupply <= 0)
@@ -1244,24 +1753,181 @@ exchangeRouter.post('/markets/claim/confirm', async (req, res) => {
             const myWinningAmount = myWinningPositions.reduce((acc, p) => acc + p.amount, 0);
             if (myWinningAmount <= 0)
                 throw new Error('No winning position to claim');
-            const payout = (market.liquidityPool * myWinningAmount) / winnerSupply;
+            const grossPayout = (market.liquidityPool * myWinningAmount) / winnerSupply;
+            const fee = computeFeeBreakdown(grossPayout);
+            const netPayout = fee.netAmount;
             for (const pos of myWinningPositions) {
                 await tx.predictionPosition.update({ where: { id: pos.id }, data: { amount: 0 } });
             }
             const claimTx = await tx.transaction.create({
-                data: { userId: user.id, txType: 'CLAIM_REWARD', marketId: market.id, amountUsdc: payout, quantity: myWinningAmount, txSignature: txSignature.trim() },
+                data: { userId: user.id, txType: 'CLAIM_REWARD', marketId: market.id, amountUsdc: netPayout, quantity: myWinningAmount, txSignature: txSignature.trim() },
             });
-            return { payout, transaction: claimTx, alreadyClaimed: false };
+            return {
+                grossPayout,
+                netPayout,
+                feeAmount: fee.feeAmount,
+                transaction: claimTx,
+                alreadyClaimed: false,
+            };
         });
+        const payoutTransfer = result.alreadyClaimed
+            ? null
+            : await sendSolPayoutToUser(user.walletAddress, result.netPayout);
         return res.json({
             message: result.alreadyClaimed ? 'Rewards already claimed' : 'Rewards claimed',
-            payout: result.payout,
+            payout: result.netPayout,
+            feeBreakdown: result.alreadyClaimed
+                ? null
+                : {
+                    feeBps: PLATFORM_FEE_BPS,
+                    feeAmount: result.feeAmount,
+                    grossPayout: result.grossPayout,
+                    netPayout: result.netPayout,
+                },
+            payoutTransfer,
             transaction: result.transaction,
         });
     }
     catch (error) {
         console.log(error);
         return res.status(500).json({ message: error.message || 'Failed to confirm claim' });
+    }
+});
+exchangeRouter.get('/admin/assets/:assetId/transactions', async (req, res) => {
+    try {
+        const authUser = await getUserFromAuthHeader(req.headers.authorization);
+        const authWallet = authUser?.walletAddress;
+        if (!isAdminRequest({ headers: req.headers }, authWallet)) {
+            return res.status(403).json({ message: 'Admin access required' });
+        }
+        const assetId = typeof req.params.assetId === 'string' ? req.params.assetId.trim() : '';
+        if (!assetId) {
+            return res.status(400).json({ message: 'assetId is required' });
+        }
+        const asset = await prisma.asset.findUnique({ where: { id: assetId } });
+        if (!asset)
+            return res.status(404).json({ message: 'Asset not found' });
+        const transactions = await prisma.transaction.findMany({
+            where: {
+                assetId,
+                txType: {
+                    in: ['BUY_ASSET', 'SELL_ASSET'],
+                },
+            },
+            include: {
+                user: {
+                    select: {
+                        id: true,
+                        walletAddress: true,
+                        username: true,
+                    },
+                },
+            },
+            orderBy: { createdAt: 'desc' },
+        });
+        return res.json(toJsonSafe({
+            message: 'Asset transactions fetched',
+            asset: {
+                id: asset.id,
+                name: asset.name,
+                circulating: asset.circulating,
+                totalSupply: asset.totalSupply,
+                currentPrice: priceAt(asset.basePrice, asset.bondingCurveK, asset.circulating),
+            },
+            count: transactions.length,
+            data: transactions,
+        }));
+    }
+    catch (error) {
+        console.log(error);
+        return res.status(500).json({ message: 'Failed to fetch asset transactions' });
+    }
+});
+exchangeRouter.get('/admin/assets/:assetId/holders', async (req, res) => {
+    try {
+        const authUser = await getUserFromAuthHeader(req.headers.authorization);
+        const authWallet = authUser?.walletAddress;
+        if (!isAdminRequest({ headers: req.headers }, authWallet)) {
+            return res.status(403).json({ message: 'Admin access required' });
+        }
+        const assetId = typeof req.params.assetId === 'string' ? req.params.assetId.trim() : '';
+        if (!assetId) {
+            return res.status(400).json({ message: 'assetId is required' });
+        }
+        const asset = await prisma.asset.findUnique({ where: { id: assetId } });
+        if (!asset)
+            return res.status(404).json({ message: 'Asset not found' });
+        const holders = await prisma.userAsset.findMany({
+            where: { assetId },
+            include: {
+                user: {
+                    select: {
+                        id: true,
+                        walletAddress: true,
+                        username: true,
+                    },
+                },
+            },
+            orderBy: [{ quantity: 'desc' }, { createdAt: 'asc' }],
+        });
+        const totalHeld = holders.reduce((sum, row) => sum + row.quantity, 0);
+        return res.json(toJsonSafe({
+            message: 'Asset holders fetched',
+            asset: {
+                id: asset.id,
+                name: asset.name,
+                circulating: asset.circulating,
+                totalSupply: asset.totalSupply,
+                currentPrice: priceAt(asset.basePrice, asset.bondingCurveK, asset.circulating),
+            },
+            holdersCount: holders.length,
+            totalHeld,
+            data: holders,
+        }));
+    }
+    catch (error) {
+        console.log(error);
+        return res.status(500).json({ message: 'Failed to fetch asset holders' });
+    }
+});
+exchangeRouter.get('/admin/transactions', async (req, res) => {
+    try {
+        const authUser = await getUserFromAuthHeader(req.headers.authorization);
+        const authWallet = authUser?.walletAddress;
+        if (!isAdminRequest({ headers: req.headers }, authWallet)) {
+            return res.status(403).json({ message: 'Admin access required' });
+        }
+        const rawTxType = typeof req.query.txType === 'string' ? req.query.txType.trim() : '';
+        const validTxTypes = ['BUY_ASSET', 'SELL_ASSET', 'BUY_PREDICTION', 'SELL_PREDICTION', 'CLAIM_REWARD'];
+        const txType = validTxTypes.includes(rawTxType)
+            ? rawTxType
+            : null;
+        if (rawTxType && !txType) {
+            return res.status(400).json({ message: 'Invalid txType' });
+        }
+        const transactions = await prisma.transaction.findMany({
+            ...(txType ? { where: { txType } } : {}),
+            include: {
+                user: {
+                    select: {
+                        id: true,
+                        walletAddress: true,
+                        username: true,
+                    },
+                },
+            },
+            orderBy: { createdAt: 'desc' },
+        });
+        return res.json(toJsonSafe({
+            message: 'Transactions fetched',
+            filter: { txType },
+            count: transactions.length,
+            data: transactions,
+        }));
+    }
+    catch (error) {
+        console.log(error);
+        return res.status(500).json({ message: 'Failed to fetch transactions' });
     }
 });
 exchangeRouter.get('/debug/exchange-state', async (_req, res) => {
