@@ -127,7 +127,24 @@ Request:
 }
 ```
 
-Response includes `metadataSource: provided|generated|none`.
+Response:
+
+```json
+{
+  "message": "Collection created",
+  "collection": {
+    "id": "cm8collection123",
+    "name": "Dota Season 1",
+    "description": "Season bucket",
+    "collectionMint": null,
+    "metadataUri": "https://ik.imagekit.io/demo/collections/dota-season-1.json",
+    "createdAt": "2026-03-13T10:12:00.000Z"
+  },
+  "metadataSource": "generated"
+}
+```
+
+`metadataSource` is `"provided"` when you pass a URI, `"generated"` when the backend auto-uploads via ImageKit, `"none"` if both are absent.
 
 ### Step A4: Mint team asset
 
@@ -394,6 +411,12 @@ Confirm response now includes devnet treasury payout transfer:
 - `GET /api/admin/assets/:assetId/holders`
 - `GET /api/admin/transactions?txType=BUY_ASSET`
 
+### User portfolio endpoints (user token required)
+
+- `GET /api/user/portfolio`
+- `GET /api/user/positions`
+- `GET /api/user/transactions`
+
 ### Public read endpoints
 
 - `GET /api/teams`
@@ -597,7 +620,7 @@ Success response:
 
 ### POST /api/admin/collections
 
-Creates an asset collection.
+Creates an asset collection. If `metadataUri` is omitted the backend auto-generates a JSON metadata file and uploads it via ImageKit.
 
 Request body example with all supported fields:
 
@@ -622,9 +645,12 @@ Success response:
     "collectionMint": "5FcollectionMint1111111111111111111111111111",
     "metadataUri": "https://ik.imagekit.io/demo/collections/blue-chip.json",
     "createdAt": "2026-03-13T10:12:00.000Z"
-  }
+  },
+  "metadataSource": "provided"
 }
 ```
+
+`metadataSource` is `"provided"` when you pass a URI, `"generated"` when the backend auto-uploads via ImageKit, `"none"` if both are absent.
 
 ### POST /api/admin/assets/mint
 
@@ -660,8 +686,13 @@ Success response:
     "currentPrice": 5,
     "totalSupply": 1000,
     "circulating": 0,
-    "bondingCurveK": 0.1,
+    "bondingCurveK": 0.05,
     "createdAt": "2026-03-13T10:15:00.000Z"
+  },
+  "pricingConfig": {
+    "basePrice": 5,
+    "kFactor": 0.05,
+    "volatilityPreset": "MEDIUM"
   },
   "mint": {
     "mintAddress": "8Mint1111111111111111111111111111111111111",
@@ -1067,11 +1098,18 @@ Success response:
     "assetId": "cm8asset123",
     "assetName": "Team Spirit Alpha",
     "quantity": 2,
-    "cost": 10.1,
-    "currentPrice": 5.4
+    "baseCost": 10.0,
+    "totalCost": 10.1,
+    "feeBreakdown": {
+      "feeBps": 100,
+      "feeAmount": 0.1
+    },
+    "currentPrice": 5.0
   }
 }
 ```
+
+Sign `unsignedTx` with the user wallet (Phantom / wallet adapter), broadcast it, then call `/confirm` with the returned signature.
 
 ### POST /api/assets/buy/confirm
 
@@ -1109,6 +1147,11 @@ Success response:
   },
   "quantity": 2,
   "totalCost": 10.1,
+  "feeBreakdown": {
+    "feeBps": 100,
+    "feeAmount": 0.1,
+    "baseCost": 10.0
+  },
   "transaction": {
     "id": "cm8tx123",
     "userId": "cm8user123",
@@ -1145,8 +1188,13 @@ Success response:
     "assetId": "cm8asset123",
     "assetName": "Team Spirit Alpha",
     "quantity": 1,
-    "payout": 5.5,
-    "currentPrice": 5.6
+    "grossPayout": 5.5,
+    "netPayout": 5.445,
+    "feeBreakdown": {
+      "feeBps": 100,
+      "feeAmount": 0.055
+    },
+    "currentPrice": 5.5
   }
 }
 ```
@@ -1186,7 +1234,13 @@ Success response:
     "createdAt": "2026-03-13T10:15:00.000Z"
   },
   "quantity": 1,
-  "totalPayout": 5.5,
+  "totalPayout": 5.445,
+  "feeBreakdown": {
+    "feeBps": 100,
+    "feeAmount": 0.055,
+    "grossPayout": 5.5,
+    "netPayout": 5.445
+  },
   "transaction": {
     "id": "cm8tx124",
     "userId": "cm8user123",
@@ -1194,7 +1248,7 @@ Success response:
     "assetId": "cm8asset123",
     "marketId": null,
     "quantity": 1,
-    "amountUsdc": 5.5,
+    "amountUsdc": 5.445,
     "txSignature": "3sellConfirm11111111111111111111111111111111",
     "createdAt": "2026-03-13T10:35:00.000Z"
   }
@@ -1226,12 +1280,19 @@ Success response:
     "marketId": "cm8market123",
     "side": "TEAM_A",
     "quantity": 5,
-    "cost": 6.25,
+    "baseCost": 6.25,
+    "totalCost": 6.3125,
+    "feeBreakdown": {
+      "feeBps": 100,
+      "feeAmount": 0.0625
+    },
     "teamAName": "Team Spirit",
     "teamBName": "Falcons"
   }
 }
 ```
+
+`side` must be exactly `"TEAM_A"` or `"TEAM_B"`. Sign and broadcast, then call `/confirm`.
 
 ### POST /api/markets/buy/confirm
 
@@ -1266,7 +1327,12 @@ Success response:
     "createdAt": "2026-03-13T10:25:00.000Z"
   },
   "quantity": 5,
-  "totalCost": 6.25,
+  "totalCost": 6.3125,
+  "feeBreakdown": {
+    "feeBps": 100,
+    "feeAmount": 0.0625,
+    "baseCost": 6.25
+  },
   "transaction": {
     "id": "cm8tx125",
     "userId": "cm8user123",
@@ -1274,7 +1340,7 @@ Success response:
     "assetId": null,
     "marketId": "cm8market123",
     "quantity": 5,
-    "amountUsdc": 6.25,
+    "amountUsdc": 6.3125,
     "txSignature": "4predictionBuy111111111111111111111111111111",
     "createdAt": "2026-03-13T10:40:00.000Z"
   }
@@ -1304,7 +1370,12 @@ Success response:
     "marketId": "cm8market123",
     "side": "TEAM_A",
     "quantity": 2,
-    "payout": 2.85,
+    "grossPayout": 2.85,
+    "netPayout": 2.8215,
+    "feeBreakdown": {
+      "feeBps": 100,
+      "feeAmount": 0.0285
+    },
     "teamAName": "Team Spirit",
     "teamBName": "Falcons"
   }
@@ -1344,7 +1415,13 @@ Success response:
     "createdAt": "2026-03-13T10:25:00.000Z"
   },
   "quantity": 2,
-  "totalPayout": 2.85,
+  "totalPayout": 2.8215,
+  "feeBreakdown": {
+    "feeBps": 100,
+    "feeAmount": 0.0285,
+    "grossPayout": 2.85,
+    "netPayout": 2.8215
+  },
   "transaction": {
     "id": "cm8tx126",
     "userId": "cm8user123",
@@ -1352,7 +1429,7 @@ Success response:
     "assetId": null,
     "marketId": "cm8market123",
     "quantity": 2,
-    "amountUsdc": 2.85,
+    "amountUsdc": 2.8215,
     "txSignature": "4predictionSell11111111111111111111111111111",
     "createdAt": "2026-03-13T10:45:00.000Z"
   }
@@ -1380,7 +1457,12 @@ Success response:
     "marketId": "cm8market123",
     "winningSide": "TEAM_A",
     "winningAmount": 12,
-    "payout": 44.6,
+    "grossPayout": 45.07,
+    "netPayout": 44.62,
+    "feeBreakdown": {
+      "feeBps": 100,
+      "feeAmount": 0.45
+    },
     "teamAName": "Team Spirit",
     "teamBName": "Falcons"
   }
@@ -1546,6 +1628,323 @@ Success response:
     "bio": "Esports fan and trader",
     "createdAt": "2026-03-13T10:00:00.000Z"
   }
+}
+```
+
+## Transparency and Audit Endpoints
+
+### GET /api/assets/:assetId/owners
+
+Public. Returns all current holders of an asset with their quantities and wallet addresses.
+
+Success response:
+
+```json
+{
+  "message": "Asset owners fetched",
+  "asset": {
+    "id": "cm8asset123",
+    "name": "Team Spirit Alpha",
+    "assetType": "TEAM",
+    "circulating": 6,
+    "totalSupply": 1000,
+    "currentPrice": 5.6
+  },
+  "holdersCount": 2,
+  "totalHeld": 6,
+  "data": [
+    {
+      "id": "cm8ua1",
+      "userId": "cm8user123",
+      "assetId": "cm8asset123",
+      "quantity": 4,
+      "avgPrice": 5.05,
+      "createdAt": "2026-03-13T10:30:00.000Z",
+      "user": {
+        "id": "cm8user123",
+        "walletAddress": "9xQeWvG816bUx9EPjHmaT23yvVMR9hM1S9h8y5RzV5j",
+        "username": "alphafan"
+      }
+    }
+  ]
+}
+```
+
+### GET /api/markets/:marketId/audit
+
+Public transparency endpoint. Returns pool state, side supply, current prices, recent trades, and settlement info.
+
+Success response:
+
+```json
+{
+  "message": "Market audit fetched",
+  "marketModel": "AMM_POOL_P2P",
+  "feeModel": { "feeBps": 100 },
+  "market": {
+    "id": "cm8market123",
+    "matchId": "cm8match123",
+    "liquidityPool": 1503.4,
+    "supplyA": 13,
+    "supplyB": 8,
+    "basePrice": 1,
+    "curveK": 0.05,
+    "status": "OPEN",
+    "teamAPrice": 1.65,
+    "teamBPrice": 1.4
+  },
+  "transparency": {
+    "poolLiquidity": 1503.4,
+    "supplyA": 13,
+    "supplyB": 8,
+    "recentTradesCount": 7
+  },
+  "settlement": null,
+  "recentTrades": [
+    {
+      "id": "cm8tx125",
+      "txType": "BUY_PREDICTION",
+      "quantity": 5,
+      "amountUsdc": 6.3125,
+      "createdAt": "2026-03-13T10:40:00.000Z",
+      "user": { "id": "cm8user123", "walletAddress": "9xQe...", "username": "alphafan" }
+    }
+  ]
+}
+```
+
+## Admin Audit Endpoints
+
+### GET /api/admin/assets/:assetId/transactions
+
+Admin only. Returns all BUY_ASSET and SELL_ASSET transactions for a specific asset.
+
+Headers: `Authorization: Bearer <admin_jwt>` or `x-admin-key: <ADMIN_API_KEY>`
+
+Success response:
+
+```json
+{
+  "message": "Asset transactions fetched",
+  "asset": {
+    "id": "cm8asset123",
+    "name": "Team Spirit Alpha",
+    "circulating": 6,
+    "totalSupply": 1000,
+    "currentPrice": 5.6
+  },
+  "count": 3,
+  "data": [
+    {
+      "id": "cm8tx123",
+      "txType": "BUY_ASSET",
+      "quantity": 2,
+      "amountUsdc": 10.1,
+      "txSignature": "3buyConfirm111111111111111111111111111111111",
+      "createdAt": "2026-03-13T10:30:00.000Z",
+      "user": {
+        "id": "cm8user123",
+        "walletAddress": "9xQeWvG816bUx9EPjHmaT23yvVMR9hM1S9h8y5RzV5j",
+        "username": "alphafan"
+      }
+    }
+  ]
+}
+```
+
+### GET /api/admin/assets/:assetId/holders
+
+Admin only. Returns all current holders of an asset sorted by quantity descending.
+
+Headers: `Authorization: Bearer <admin_jwt>` or `x-admin-key: <ADMIN_API_KEY>`
+
+Success response:
+
+```json
+{
+  "message": "Asset holders fetched",
+  "asset": {
+    "id": "cm8asset123",
+    "name": "Team Spirit Alpha",
+    "circulating": 6,
+    "totalSupply": 1000,
+    "currentPrice": 5.6
+  },
+  "holdersCount": 2,
+  "totalHeld": 6,
+  "data": [
+    {
+      "id": "cm8ua1",
+      "quantity": 4,
+      "avgPrice": 5.05,
+      "createdAt": "2026-03-13T10:30:00.000Z",
+      "user": {
+        "id": "cm8user123",
+        "walletAddress": "9xQeWvG816bUx9EPjHmaT23yvVMR9hM1S9h8y5RzV5j",
+        "username": "alphafan"
+      }
+    }
+  ]
+}
+```
+
+### GET /api/admin/transactions
+
+Admin only. Returns all platform transactions. Filter by type with `?txType=` query param.
+
+Valid `txType` values: `BUY_ASSET`, `SELL_ASSET`, `BUY_PREDICTION`, `SELL_PREDICTION`, `CLAIM_REWARD`.
+
+Headers: `Authorization: Bearer <admin_jwt>` or `x-admin-key: <ADMIN_API_KEY>`
+
+Success response:
+
+```json
+{
+  "message": "Transactions fetched",
+  "filter": { "txType": "BUY_ASSET" },
+  "count": 2,
+  "data": [
+    {
+      "id": "cm8tx123",
+      "userId": "cm8user123",
+      "txType": "BUY_ASSET",
+      "assetId": "cm8asset123",
+      "marketId": null,
+      "quantity": 2,
+      "amountUsdc": 10.1,
+      "txSignature": "3buyConfirm111111111111111111111111111111111",
+      "createdAt": "2026-03-13T10:30:00.000Z",
+      "user": {
+        "id": "cm8user123",
+        "walletAddress": "9xQeWvG816bUx9EPjHmaT23yvVMR9hM1S9h8y5RzV5j",
+        "username": "alphafan"
+      }
+    }
+  ]
+}
+```
+
+## User Portfolio Endpoints
+
+All three endpoints require `Authorization: Bearer <user_jwt>`.
+
+### GET /api/user/portfolio
+
+Returns all assets the user currently holds, with current price, value, and unrealized P&L per holding plus an overall summary.
+
+Success response:
+
+```json
+{
+  "message": "Portfolio fetched",
+  "summary": {
+    "totalHoldings": 2,
+    "totalValue": 27.8,
+    "totalCost": 22.0,
+    "totalUnrealizedPnl": 5.8,
+    "totalUnrealizedPnlPct": 26.36
+  },
+  "holdings": [
+    {
+      "holdingId": "cm8ua1",
+      "asset": {
+        "id": "cm8asset123",
+        "name": "Team Spirit Alpha",
+        "assetType": "TEAM",
+        "mintAddress": "8Mint1111111111111111111111111111111111111",
+        "metadataUri": "https://ik.imagekit.io/demo/assets/team-spirit-alpha.json",
+        "team": { "id": "cm8team123", "name": "Team Spirit", "logoUrl": null },
+        "collection": { "id": "cm8collection123", "name": "Blue Chip Teams" }
+      },
+      "quantity": 4,
+      "avgBuyPrice": 5.05,
+      "currentPrice": 5.6,
+      "currentValue": 22.4,
+      "costBasis": 20.2,
+      "unrealizedPnl": 2.2,
+      "unrealizedPnlPct": 10.89,
+      "acquiredAt": "2026-03-13T10:30:00.000Z"
+    }
+  ]
+}
+```
+
+### GET /api/user/positions
+
+Returns all open prediction market positions the user holds, with current sell value and unrealized P&L.
+
+Success response:
+
+```json
+{
+  "message": "Positions fetched",
+  "totalPositions": 1,
+  "positions": [
+    {
+      "positionId": "cm8pos1",
+      "market": {
+        "id": "cm8market123",
+        "status": "OPEN",
+        "match": {
+          "id": "cm8match123",
+          "startTime": "2026-03-20T16:00:00.000Z",
+          "result": null,
+          "teamA": { "id": "cm8team123", "name": "Team Spirit", "logoUrl": null },
+          "teamB": { "id": "cm8team456", "name": "Falcons", "logoUrl": null }
+        }
+      },
+      "side": "TEAM_A",
+      "amount": 5,
+      "avgBuyPrice": 1.2625,
+      "currentPrice": 1.65,
+      "currentValue": 7.6,
+      "costBasis": 6.3125,
+      "unrealizedPnl": 1.29,
+      "unrealizedPnlPct": 20.43,
+      "openedAt": "2026-03-13T10:40:00.000Z"
+    }
+  ]
+}
+```
+
+### GET /api/user/transactions
+
+Returns the authenticated user's paginated transaction history.
+
+Query params: `limit` (default 20, max 100), `offset` (default 0).
+
+Example: `GET /api/user/transactions?limit=10&offset=0`
+
+Success response:
+
+```json
+{
+  "message": "Transactions fetched",
+  "pagination": { "total": 5, "limit": 10, "offset": 0 },
+  "transactions": [
+    {
+      "id": "cm8tx127",
+      "userId": "cm8user123",
+      "txType": "CLAIM_REWARD",
+      "assetId": null,
+      "marketId": "cm8market123",
+      "quantity": 12,
+      "amountUsdc": 44.62,
+      "txSignature": "4claim111111111111111111111111111111111111",
+      "createdAt": "2026-03-13T10:50:00.000Z"
+    },
+    {
+      "id": "cm8tx123",
+      "userId": "cm8user123",
+      "txType": "BUY_ASSET",
+      "assetId": "cm8asset123",
+      "marketId": null,
+      "quantity": 2,
+      "amountUsdc": 10.1,
+      "txSignature": "3buyConfirm111111111111111111111111111111111",
+      "createdAt": "2026-03-13T10:30:00.000Z"
+    }
+  ]
 }
 ```
 

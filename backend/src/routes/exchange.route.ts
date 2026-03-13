@@ -2222,6 +2222,177 @@ exchangeRouter.get('/admin/transactions', async (req, res) => {
     }
 })
 
+// ─── USER PORTFOLIO ──────────────────────────────────────────────────────────
+
+exchangeRouter.get('/user/portfolio', async (req, res) => {
+    try {
+        const user = await getUserFromAuthHeader(req.headers.authorization)
+        if (!user) return res.status(401).json({ message: 'Unauthorized' })
+
+        const holdings = await prisma.userAsset.findMany({
+            where: { userId: user.id },
+            include: {
+                asset: {
+                    include: {
+                        team: { select: { id: true, name: true, logoUrl: true } },
+                        collection: { select: { id: true, name: true } },
+                    },
+                },
+            },
+            orderBy: { createdAt: 'asc' },
+        })
+
+        const items = holdings.map((h) => {
+            const asset = h.asset
+            const currentPrice = priceAt(asset.basePrice, asset.bondingCurveK, asset.circulating)
+            const currentValue = currentPrice * h.quantity
+            const costBasis = h.avgPrice * h.quantity
+            const unrealizedPnl = currentValue - costBasis
+            const unrealizedPnlPct = costBasis > 0 ? (unrealizedPnl / costBasis) * 100 : 0
+
+            return {
+                holdingId: h.id,
+                asset: {
+                    id: asset.id,
+                    name: asset.name,
+                    assetType: asset.assetType,
+                    mintAddress: asset.mintAddress,
+                    metadataUri: asset.metadataUri,
+                    team: asset.team,
+                    collection: asset.collection,
+                },
+                quantity: h.quantity,
+                avgBuyPrice: h.avgPrice,
+                currentPrice,
+                currentValue,
+                costBasis,
+                unrealizedPnl,
+                unrealizedPnlPct: Number(unrealizedPnlPct.toFixed(2)),
+                acquiredAt: h.createdAt,
+            }
+        })
+
+        const totalValue = items.reduce((s, i) => s + i.currentValue, 0)
+        const totalCost = items.reduce((s, i) => s + i.costBasis, 0)
+        const totalPnl = totalValue - totalCost
+
+        return res.json(toJsonSafe({
+            message: 'Portfolio fetched',
+            summary: {
+                totalHoldings: items.length,
+                totalValue,
+                totalCost,
+                totalUnrealizedPnl: totalPnl,
+                totalUnrealizedPnlPct: totalCost > 0 ? Number(((totalPnl / totalCost) * 100).toFixed(2)) : 0,
+            },
+            holdings: items,
+        }))
+    } catch (error) {
+        console.log(error)
+        return res.status(500).json({ message: 'Failed to fetch portfolio' })
+    }
+})
+
+exchangeRouter.get('/user/positions', async (req, res) => {
+    try {
+        const user = await getUserFromAuthHeader(req.headers.authorization)
+        if (!user) return res.status(401).json({ message: 'Unauthorized' })
+
+        const positions = await prisma.predictionPosition.findMany({
+            where: { userId: user.id },
+            include: {
+                market: {
+                    include: {
+                        match: {
+                            include: {
+                                teamA: { select: { id: true, name: true, logoUrl: true } },
+                                teamB: { select: { id: true, name: true, logoUrl: true } },
+                            },
+                        },
+                    },
+                },
+            },
+            orderBy: { createdAt: 'desc' },
+        })
+
+        const items = positions.map((p) => {
+            const market = p.market
+            const match = market.match
+            const sideSupply = p.team === 'TEAM_A' ? market.supplyA : market.supplyB
+            const currentPrice = marketSidePrice(market.basePrice, market.curveK, sideSupply)
+            const currentValue = marketSellPayout(market.basePrice, market.curveK, sideSupply, p.amount)
+            const costBasis = p.avgPrice * p.amount
+            const unrealizedPnl = currentValue - costBasis
+            const unrealizedPnlPct = costBasis > 0 ? (unrealizedPnl / costBasis) * 100 : 0
+
+            return {
+                positionId: p.id,
+                market: {
+                    id: market.id,
+                    status: market.status,
+                    match: {
+                        id: match.id,
+                        startTime: match.startTime,
+                        result: match.result,
+                        teamA: match.teamA,
+                        teamB: match.teamB,
+                    },
+                },
+                side: p.team,
+                amount: p.amount,
+                avgBuyPrice: p.avgPrice,
+                currentPrice,
+                currentValue,
+                costBasis,
+                unrealizedPnl,
+                unrealizedPnlPct: Number(unrealizedPnlPct.toFixed(2)),
+                openedAt: p.createdAt,
+            }
+        })
+
+        return res.json(toJsonSafe({
+            message: 'Positions fetched',
+            totalPositions: items.length,
+            positions: items,
+        }))
+    } catch (error) {
+        console.log(error)
+        return res.status(500).json({ message: 'Failed to fetch positions' })
+    }
+})
+
+exchangeRouter.get('/user/transactions', async (req, res) => {
+    try {
+        const user = await getUserFromAuthHeader(req.headers.authorization)
+        if (!user) return res.status(401).json({ message: 'Unauthorized' })
+
+        const { limit, offset } = req.query as { limit?: string; offset?: string }
+        const take = Math.min(100, Math.max(1, parseInt(limit ?? '20', 10) || 20))
+        const skip = Math.max(0, parseInt(offset ?? '0', 10) || 0)
+
+        const [txs, total] = await Promise.all([
+            prisma.transaction.findMany({
+                where: { userId: user.id },
+                orderBy: { createdAt: 'desc' },
+                take,
+                skip,
+            }),
+            prisma.transaction.count({ where: { userId: user.id } }),
+        ])
+
+        return res.json(toJsonSafe({
+            message: 'Transactions fetched',
+            pagination: { total, limit: take, offset: skip },
+            transactions: txs,
+        }))
+    } catch (error) {
+        console.log(error)
+        return res.status(500).json({ message: 'Failed to fetch transactions' })
+    }
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 exchangeRouter.get('/debug/exchange-state', async (_req, res) => {
     try {
         const [teams, assets, matches, markets] = await Promise.all([
