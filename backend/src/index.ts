@@ -1,0 +1,21 @@
+import express from 'express'
+import userRouter from './routes/user.route.js'
+import propertyRouter from './routes/property.route.js'
+import tradingRouter from './routes/trading.route.js'
+const app = express()
+
+app.use(express.json())
+
+app.use('/user', userRouter)
+app.use('/property', propertyRouter)
+app.use('/api', tradingRouter)
+
+app.get('/',(req:any,res:any)=>{
+    res.json({
+        "message" : "solana is great"
+    })
+})
+
+app.listen(3000, () => {
+    console.log('App is listening on port 3000')
+})
