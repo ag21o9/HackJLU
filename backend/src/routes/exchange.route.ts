@@ -1410,7 +1410,7 @@ exchangeRouter.post('/markets/claim/confirm', async (req, res) => {
             for (const pos of myWinningPositions) {
                 await tx.predictionPosition.update({ where: { id: pos.id }, data: { amount: 0 } })
             }
-            
+
             const claimTx = await tx.transaction.create({
                 data: { userId: user.id, txType: 'CLAIM_REWARD', marketId: market.id, amountUsdc: payout, quantity: myWinningAmount, txSignature: txSignature.trim() },
             })

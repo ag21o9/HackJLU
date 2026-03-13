@@ -1,4 +1,4 @@
-# Esports Exchange API Documentation
+# Esports Exchange API — Frontend Developer Reference
 
 ## Overview
 
