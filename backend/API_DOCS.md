@@ -32,14 +32,15 @@ Authorization: Bearer <jwt>
 
 JWT tokens are issued by:
 
-- `POST /api/auth/wallet`
+- `POST /api/auth/wallet` — regular users
+- `POST /api/auth/admin` — admin wallets only
 - `POST /user/signin` (legacy flow)
 
 ## Admin Authorization
 
 Admin endpoints accept either of these authorization models:
 
-1. Valid JWT for a wallet address included in `ADMIN_WALLETS`
+1. JWT issued by `POST /api/auth/admin` (wallet must be in `ADMIN_WALLETS`)
 2. `x-admin-key: <ADMIN_API_KEY>` header if `ADMIN_API_KEY` is configured
 
 Recommended admin request headers:
@@ -114,6 +115,7 @@ Response:
 ### Exchange and Trading Routes under `/api`
 
 - `POST /api/auth/wallet`
+- `POST /api/auth/admin`
 - `POST /api/admin/teams`
 - `POST /api/admin/collections`
 - `POST /api/admin/assets/mint`
@@ -315,6 +317,64 @@ Possible error responses:
 {
   "message": "Incorrect signature"
 }
+```
+
+### POST /api/auth/admin
+
+Authenticates an admin wallet and returns a JWT with admin privileges. The wallet must be listed in the `ADMIN_WALLETS` environment variable.
+
+Headers:
+
+```http
+Content-Type: application/json
+```
+
+Request body:
+
+```json
+{
+  "walletAddress": "9xQeWvG816bUx9EPjHmaT23yvVMR9hM1S9h8y5RzV5j",
+  "signature": "MEUCIQDbExampleBase64SignatureStringThatDecodesTo64Bytes=="
+}
+```
+
+Notes:
+
+- Uses the same signature verification as `/api/auth/wallet`
+- Returns `403` immediately if wallet is not in `ADMIN_WALLETS`
+- Issued JWT contains `{ userId, isAdmin: true }` payload
+
+Success response:
+
+```json
+{
+  "message": "Admin authenticated",
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.example.token",
+  "isAdmin": true,
+  "user": {
+    "id": "cm8user123",
+    "walletAddress": "9xQeWvG816bUx9EPjHmaT23yvVMR9hM1S9h8y5RzV5j",
+    "username": "adminuser"
+  }
+}
+```
+
+Possible error responses:
+
+```json
+{ "message": "Invalid walletAddress" }
+```
+
+```json
+{ "message": "Invalid signature format/size (expected 64 bytes)" }
+```
+
+```json
+{ "message": "Incorrect signature" }
+```
+
+```json
+{ "message": "Wallet is not an admin" }
 ```
 
 ## Admin Endpoints

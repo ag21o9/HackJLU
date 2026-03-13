@@ -277,6 +277,48 @@ exchangeRouter.post('/auth/wallet', async (req, res) => {
         return res.status(500).json({ message: 'Failed wallet auth' });
     }
 });
+exchangeRouter.post('/auth/admin', async (req, res) => {
+    try {
+        const { walletAddress, signature } = req.body;
+        const parsedWallet = parseWalletAddress(walletAddress);
+        if (!parsedWallet) {
+            return res.status(400).json({ message: 'Invalid walletAddress' });
+        }
+        const sigBytes = normalizeSignature(signature);
+        if (!sigBytes || sigBytes.length !== 64) {
+            return res.status(400).json({ message: 'Invalid signature format/size (expected 64 bytes)' });
+        }
+        const message = new TextEncoder().encode(AUTH_MESSAGE);
+        const isValid = nacl.sign.detached.verify(message, sigBytes, new PublicKey(parsedWallet).toBytes());
+        if (!isValid) {
+            return res.status(401).json({ message: 'Incorrect signature' });
+        }
+        const adminWallets = (process.env.ADMIN_WALLETS ?? '')
+            .split(',')
+            .map((item) => item.trim())
+            .filter(Boolean);
+        if (!adminWallets.includes(parsedWallet)) {
+            return res.status(403).json({ message: 'Wallet is not an admin' });
+        }
+        const existingUser = await prisma.user.findUnique({ where: { walletAddress: parsedWallet } });
+        const user = existingUser ?? await prisma.user.create({ data: { walletAddress: parsedWallet } });
+        const token = jwt.sign({ userId: user.id, isAdmin: true }, JWT_SECRET);
+        return res.json({
+            message: 'Admin authenticated',
+            token,
+            isAdmin: true,
+            user: {
+                id: user.id,
+                walletAddress: user.walletAddress,
+                username: user.username,
+            },
+        });
+    }
+    catch (error) {
+        console.log(error);
+        return res.status(500).json({ message: 'Failed admin auth' });
+    }
+});
 exchangeRouter.post('/admin/teams', async (req, res) => {
     try {
         const authUser = await getUserFromAuthHeader(req.headers.authorization);
