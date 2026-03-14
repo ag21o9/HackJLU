@@ -3,7 +3,7 @@ import jwt from 'jsonwebtoken';
 import nacl from 'tweetnacl';
 import bs58 from 'bs58';
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, TransactionInstruction, clusterApiUrl, sendAndConfirmTransaction, } from '@solana/web3.js';
-import { ASSOCIATED_TOKEN_PROGRAM_ID, MINT_SIZE, TOKEN_PROGRAM_ID, createAssociatedTokenAccountInstruction, createInitializeMintInstruction, createMintToInstruction, createTransferInstruction, getAssociatedTokenAddress, getMinimumBalanceForRentExemptMint, } from '@solana/spl-token';
+import { ASSOCIATED_TOKEN_PROGRAM_ID, MINT_SIZE, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, createAssociatedTokenAccountInstruction, createInitializeMintInstruction, createMintToInstruction, createTransferInstruction, getAssociatedTokenAddress, getMinimumBalanceForRentExemptMint, } from '@solana/spl-token';
 import { Prisma, PredictionSide } from '../generated/prisma/client.js';
 import { prisma } from '../prisma.config.js';
 import { uploadFile } from '../config/imageKit.config.js';
@@ -16,11 +16,17 @@ const PLATFORM_FEE_BPS = (() => {
         return 100;
     return Math.min(200, Math.max(0, Math.round(parsed)));
 })();
-const CLAIM_SOL_PER_USDC = (() => {
-    const parsed = Number(process.env.CLAIM_SOL_PER_USDC ?? '0.0001');
+const SOL_PER_USDC = (() => {
+    const parsed = Number(process.env.SOL_PER_USDC ?? '0.0001');
     if (!Number.isFinite(parsed) || parsed <= 0)
         return 0.0001;
     return parsed;
+})();
+const USDC_DECIMALS = (() => {
+    const parsed = Number(process.env.USDC_DECIMALS ?? '6');
+    if (!Number.isFinite(parsed))
+        return 6;
+    return Math.max(0, Math.min(9, Math.trunc(parsed)));
 })();
 const VOLATILITY_PRESETS = {
     LOW: 0.01,
@@ -129,6 +135,73 @@ function getPlatformSigner() {
     catch (error) {
         throw new Error(`Invalid PLATFORM_SIGNER_SECRET format: ${error.message}`);
     }
+}
+function getUsdcMint() {
+    const mint = process.env.USDC_MINT_ADDRESS;
+    if (!mint || !mint.trim()) {
+        throw new Error('Missing USDC_MINT_ADDRESS env var');
+    }
+    try {
+        return new PublicKey(mint.trim());
+    }
+    catch {
+        throw new Error('Invalid USDC_MINT_ADDRESS env var');
+    }
+}
+function toTokenBaseUnits(amount, decimals) {
+    if (!Number.isFinite(amount) || amount < 0)
+        return 0n;
+    const multiplier = 10 ** decimals;
+    return BigInt(Math.round(amount * multiplier));
+}
+function quoteAmountToSol(amount) {
+    if (!Number.isFinite(amount) || amount <= 0)
+        return 0;
+    return Number((amount * SOL_PER_USDC).toFixed(9));
+}
+function quoteAmountToLamports(amount) {
+    const solAmount = quoteAmountToSol(amount);
+    return Math.max(1, Math.floor(solAmount * LAMPORTS_PER_SOL));
+}
+async function getTokenProgramForMint(connection, mint) {
+    const mintAccount = await connection.getAccountInfo(mint);
+    if (!mintAccount) {
+        throw new Error(`Mint not found: ${mint.toBase58()}`);
+    }
+    if (mintAccount.owner.equals(TOKEN_PROGRAM_ID) || mintAccount.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+        return mintAccount.owner;
+    }
+    throw new Error(`Unsupported token program for mint: ${mint.toBase58()}`);
+}
+async function fundUserUsdcWallet(params) {
+    const connection = getSolanaConnection();
+    const payer = getPlatformSigner();
+    const usdcMint = getUsdcMint();
+    const usdcTokenProgram = await getTokenProgramForMint(connection, usdcMint);
+    const recipient = new PublicKey(params.walletAddress);
+    const treasuryUsdcAta = await getAssociatedTokenAddress(usdcMint, payer.publicKey, false, usdcTokenProgram, ASSOCIATED_TOKEN_PROGRAM_ID);
+    const userUsdcAta = await getAssociatedTokenAddress(usdcMint, recipient, false, usdcTokenProgram, ASSOCIATED_TOKEN_PROGRAM_ID);
+    const amountBaseUnits = toTokenBaseUnits(params.amount, USDC_DECIMALS);
+    if (amountBaseUnits <= 0n) {
+        throw new Error('amount must be greater than zero');
+    }
+    const { blockhash } = await connection.getLatestBlockhash('confirmed');
+    const tx = new Transaction({ feePayer: payer.publicKey, recentBlockhash: blockhash });
+    if (!(await connection.getAccountInfo(treasuryUsdcAta))) {
+        tx.add(createAssociatedTokenAccountInstruction(payer.publicKey, treasuryUsdcAta, payer.publicKey, usdcMint, usdcTokenProgram, ASSOCIATED_TOKEN_PROGRAM_ID));
+    }
+    if (!(await connection.getAccountInfo(userUsdcAta))) {
+        tx.add(createAssociatedTokenAccountInstruction(payer.publicKey, userUsdcAta, recipient, usdcMint, usdcTokenProgram, ASSOCIATED_TOKEN_PROGRAM_ID));
+    }
+    tx.add(createTransferInstruction(treasuryUsdcAta, userUsdcAta, payer.publicKey, amountBaseUnits, [], usdcTokenProgram));
+    const txSignature = await sendAndConfirmTransaction(connection, tx, [payer], { commitment: 'confirmed' });
+    return {
+        txSignature,
+        userUsdcAta: userUsdcAta.toBase58(),
+        treasuryUsdcAta: treasuryUsdcAta.toBase58(),
+        amount: params.amount,
+        amountBaseUnits: amountBaseUnits.toString(),
+    };
 }
 async function mintAssetToken(params) {
     const connection = getSolanaConnection();
@@ -293,22 +366,7 @@ function parseBase64Image(input) {
     }
 }
 async function sendSolPayoutToUser(walletAddress, payoutUsdc) {
-    const connection = getSolanaConnection();
-    const payer = getPlatformSigner();
-    const recipient = new PublicKey(walletAddress);
-    const solAmount = Number((payoutUsdc * CLAIM_SOL_PER_USDC).toFixed(9));
-    const lamports = Math.max(1, Math.floor(solAmount * LAMPORTS_PER_SOL));
-    const { blockhash } = await connection.getLatestBlockhash('confirmed');
-    const tx = new Transaction({
-        feePayer: payer.publicKey,
-        recentBlockhash: blockhash,
-    }).add(SystemProgram.transfer({
-        fromPubkey: payer.publicKey,
-        toPubkey: recipient,
-        lamports,
-    }));
-    const txSignature = await sendAndConfirmTransaction(connection, tx, [payer], { commitment: 'confirmed' });
-    return { txSignature, lamports, solAmount };
+    throw new Error(`Legacy function disabled. Configure USDC settlement; requested payout for wallet ${walletAddress} amount ${payoutUsdc}`);
 }
 function priceAt(basePrice, kFactor, supply) {
     return basePrice + (kFactor * supply);
@@ -344,26 +402,45 @@ async function sendMemoTransaction(payload) {
     }).add(memoIx);
     return sendAndConfirmTransaction(connection, tx, [payer], { commitment: 'confirmed' });
 }
+async function wait(ms) {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+}
 async function getConfirmedTxMemo(signature) {
     const connection = getSolanaConnection();
-    const parsed = await connection.getParsedTransaction(signature, {
-        commitment: 'confirmed',
-        maxSupportedTransactionVersion: 0,
-    });
-    if (!parsed || parsed.meta?.err)
-        return null;
     const memoAddr = MEMO_PROGRAM_ID.toBase58();
-    for (const ix of parsed.transaction.message.instructions) {
-        if (ix.programId.toBase58() !== memoAddr)
+    for (let attempt = 0; attempt < 7; attempt += 1) {
+        const parsed = await connection.getParsedTransaction(signature, {
+            commitment: 'confirmed',
+            maxSupportedTransactionVersion: 0,
+        });
+        if (!parsed) {
+            if (attempt < 6)
+                await wait(700);
             continue;
-        if (!('data' in ix))
-            continue;
-        try {
-            return JSON.parse(Buffer.from(bs58.decode(ix.data)).toString('utf8'));
         }
-        catch {
+        if (parsed.meta?.err)
             return null;
+        for (const ix of parsed.transaction.message.instructions) {
+            if (ix.programId.toBase58() !== memoAddr)
+                continue;
+            if ('parsed' in ix && typeof ix.parsed === 'string') {
+                try {
+                    return JSON.parse(ix.parsed);
+                }
+                catch {
+                    return null;
+                }
+            }
+            if ('data' in ix) {
+                try {
+                    return JSON.parse(Buffer.from(bs58.decode(ix.data)).toString('utf8'));
+                }
+                catch {
+                    return null;
+                }
+            }
         }
+        return null;
     }
     return null;
 }
@@ -865,6 +942,38 @@ exchangeRouter.post('/admin/matches/result', async (req, res) => {
         return res.status(500).json({ message: 'Failed to set match result' });
     }
 });
+exchangeRouter.post('/admin/usdc/fund', async (req, res) => {
+    try {
+        const authUser = await getUserFromAuthHeader(req.headers.authorization);
+        const authWallet = authUser?.walletAddress;
+        if (!isAdminRequest({ headers: req.headers }, authWallet)) {
+            return res.status(403).json({ message: 'Admin access required' });
+        }
+        const { walletAddress, amount } = req.body;
+        const parsedWalletAddress = parseWalletAddress(walletAddress);
+        const parsedAmount = requirePositiveNumber(amount);
+        if (!parsedWalletAddress) {
+            return res.status(400).json({ message: 'walletAddress must be a valid Solana public key' });
+        }
+        if (!parsedAmount) {
+            return res.status(400).json({ message: 'amount must be a positive number' });
+        }
+        const funding = await fundUserUsdcWallet({
+            walletAddress: parsedWalletAddress,
+            amount: parsedAmount,
+        });
+        return res.status(201).json({
+            message: 'Devnet USDC funded',
+            mintAddress: getUsdcMint().toBase58(),
+            decimals: USDC_DECIMALS,
+            funding,
+        });
+    }
+    catch (error) {
+        console.log(error);
+        return res.status(500).json({ message: error.message || 'Failed to fund devnet USDC' });
+    }
+});
 exchangeRouter.get('/teams', async (_req, res) => {
     try {
         const teams = await prisma.team.findMany({
@@ -971,8 +1080,15 @@ exchangeRouter.post('/assets/buy/prepare', async (req, res) => {
         const userWallet = new PublicKey(user.walletAddress);
         const treasuryATA = await getAssociatedTokenAddress(mint, payer.publicKey, false, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
         const userATA = await getAssociatedTokenAddress(mint, userWallet, false, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
+        const totalCostLamports = quoteAmountToLamports(totalCost);
+        const totalCostSol = quoteAmountToSol(totalCost);
         const { blockhash } = await connection.getLatestBlockhash('confirmed');
         const tx = new Transaction({ feePayer: payer.publicKey, recentBlockhash: blockhash });
+        tx.add(SystemProgram.transfer({
+            fromPubkey: userWallet,
+            toPubkey: payer.publicKey,
+            lamports: totalCostLamports,
+        }));
         if (!(await connection.getAccountInfo(userATA))) {
             tx.add(createAssociatedTokenAccountInstruction(payer.publicKey, userATA, userWallet, mint, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID));
         }
@@ -1004,6 +1120,9 @@ exchangeRouter.post('/assets/buy/prepare', async (req, res) => {
                     feeBps: fee.feeBps,
                     feeAmount: fee.feeAmount,
                 },
+                settlementAsset: 'SOL',
+                settlementAmountSol: totalCostSol,
+                settlementLamports: totalCostLamports,
                 currentPrice: priceAt(asset.basePrice, asset.bondingCurveK, asset.circulating),
             },
         });
@@ -1028,7 +1147,7 @@ exchangeRouter.post('/assets/buy/confirm', async (req, res) => {
             return res.status(400).json({ message: 'quantity must be a positive integer' });
         const memo = await getConfirmedTxMemo(txSignature.trim());
         if (!memo)
-            return res.status(400).json({ message: 'Transaction not found on-chain or missing memo' });
+            return res.status(400).json({ message: 'Transaction not found on-chain or missing memo. Ensure you broadcasted the exact unsignedTx from prepare on the same RPC cluster, then retry confirm after 2-5 seconds.' });
         if (memo.op !== 'buy_asset' || memo.assetId !== assetId.trim() || Number(memo.quantity) !== parsedQuantity) {
             return res.status(400).json({ message: 'Transaction memo does not match request parameters' });
         }
@@ -1112,10 +1231,17 @@ exchangeRouter.post('/assets/sell/prepare', async (req, res) => {
         const userWallet = new PublicKey(user.walletAddress);
         const treasuryATA = await getAssociatedTokenAddress(mint, payer.publicKey, false, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
         const userATA = await getAssociatedTokenAddress(mint, userWallet, false, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
+        const netPayoutLamports = quoteAmountToLamports(netPayout);
+        const netPayoutSol = quoteAmountToSol(netPayout);
         const { blockhash } = await connection.getLatestBlockhash('confirmed');
         const tx = new Transaction({ feePayer: payer.publicKey, recentBlockhash: blockhash });
         // User owns their ATA — Phantom must sign as token transfer authority
         tx.add(createTransferInstruction(userATA, treasuryATA, userWallet, parsedQuantity, [], TOKEN_PROGRAM_ID));
+        tx.add(SystemProgram.transfer({
+            fromPubkey: payer.publicKey,
+            toPubkey: userWallet,
+            lamports: netPayoutLamports,
+        }));
         tx.add(new TransactionInstruction({
             programId: MEMO_PROGRAM_ID,
             keys: [{ pubkey: userWallet, isSigner: true, isWritable: false }],
@@ -1142,6 +1268,9 @@ exchangeRouter.post('/assets/sell/prepare', async (req, res) => {
                     feeBps: fee.feeBps,
                     feeAmount: fee.feeAmount,
                 },
+                settlementAsset: 'SOL',
+                settlementAmountSol: netPayoutSol,
+                settlementLamports: netPayoutLamports,
                 currentPrice: priceAt(asset.basePrice, asset.bondingCurveK, asset.circulating),
             },
         });
@@ -1166,7 +1295,7 @@ exchangeRouter.post('/assets/sell/confirm', async (req, res) => {
             return res.status(400).json({ message: 'quantity must be a positive integer' });
         const memo = await getConfirmedTxMemo(txSignature.trim());
         if (!memo)
-            return res.status(400).json({ message: 'Transaction not found on-chain or missing memo' });
+            return res.status(400).json({ message: 'Transaction not found on-chain or missing memo. Ensure you broadcasted the exact unsignedTx from prepare on the same RPC cluster, then retry confirm after 2-5 seconds.' });
         if (memo.op !== 'sell_asset' || memo.assetId !== assetId.trim() || Number(memo.quantity) !== parsedQuantity) {
             return res.status(400).json({ message: 'Transaction memo does not match request parameters' });
         }
@@ -1368,9 +1497,17 @@ exchangeRouter.post('/markets/buy/prepare', async (req, res) => {
         const fee = computeFeeBreakdown(baseCost);
         const totalCost = fee.grossAmount;
         const payer = getPlatformSigner();
+        const connection = getSolanaConnection();
         const userWallet = new PublicKey(user.walletAddress);
-        const { blockhash } = await getSolanaConnection().getLatestBlockhash('confirmed');
+        const totalCostLamports = quoteAmountToLamports(totalCost);
+        const totalCostSol = quoteAmountToSol(totalCost);
+        const { blockhash } = await connection.getLatestBlockhash('confirmed');
         const tx = new Transaction({ feePayer: payer.publicKey, recentBlockhash: blockhash });
+        tx.add(SystemProgram.transfer({
+            fromPubkey: userWallet,
+            toPubkey: payer.publicKey,
+            lamports: totalCostLamports,
+        }));
         // Prediction positions are off-chain DB records; user signs a memo as proof of intent
         tx.add(new TransactionInstruction({
             programId: MEMO_PROGRAM_ID,
@@ -1398,6 +1535,9 @@ exchangeRouter.post('/markets/buy/prepare', async (req, res) => {
                     feeBps: fee.feeBps,
                     feeAmount: fee.feeAmount,
                 },
+                settlementAsset: 'SOL',
+                settlementAmountSol: totalCostSol,
+                settlementLamports: totalCostLamports,
                 teamAName: market.match.teamA.name,
                 teamBName: market.match.teamB.name,
             },
@@ -1425,7 +1565,7 @@ exchangeRouter.post('/markets/buy/confirm', async (req, res) => {
             return res.status(400).json({ message: 'quantity must be a positive integer' });
         const memo = await getConfirmedTxMemo(txSignature.trim());
         if (!memo)
-            return res.status(400).json({ message: 'Transaction not found on-chain or missing memo' });
+            return res.status(400).json({ message: 'Transaction not found on-chain or missing memo. Ensure you broadcasted the exact unsignedTx from prepare on the same RPC cluster, then retry confirm after 2-5 seconds.' });
         if (memo.op !== 'buy_prediction' || memo.marketId !== marketId.trim() || memo.side !== side || Number(memo.quantity) !== parsedQuantity) {
             return res.status(400).json({ message: 'Transaction memo does not match request parameters' });
         }
@@ -1515,9 +1655,17 @@ exchangeRouter.post('/markets/sell/prepare', async (req, res) => {
         const fee = computeFeeBreakdown(grossPayout);
         const netPayout = fee.netAmount;
         const payer = getPlatformSigner();
+        const connection = getSolanaConnection();
         const userWallet = new PublicKey(user.walletAddress);
-        const { blockhash } = await getSolanaConnection().getLatestBlockhash('confirmed');
+        const netPayoutLamports = quoteAmountToLamports(netPayout);
+        const netPayoutSol = quoteAmountToSol(netPayout);
+        const { blockhash } = await connection.getLatestBlockhash('confirmed');
         const tx = new Transaction({ feePayer: payer.publicKey, recentBlockhash: blockhash });
+        tx.add(SystemProgram.transfer({
+            fromPubkey: payer.publicKey,
+            toPubkey: userWallet,
+            lamports: netPayoutLamports,
+        }));
         tx.add(new TransactionInstruction({
             programId: MEMO_PROGRAM_ID,
             keys: [{ pubkey: userWallet, isSigner: true, isWritable: false }],
@@ -1544,6 +1692,9 @@ exchangeRouter.post('/markets/sell/prepare', async (req, res) => {
                     feeBps: fee.feeBps,
                     feeAmount: fee.feeAmount,
                 },
+                settlementAsset: 'SOL',
+                settlementAmountSol: netPayoutSol,
+                settlementLamports: netPayoutLamports,
                 teamAName: market.match.teamA.name,
                 teamBName: market.match.teamB.name,
             },
@@ -1571,7 +1722,7 @@ exchangeRouter.post('/markets/sell/confirm', async (req, res) => {
             return res.status(400).json({ message: 'quantity must be a positive integer' });
         const memo = await getConfirmedTxMemo(txSignature.trim());
         if (!memo)
-            return res.status(400).json({ message: 'Transaction not found on-chain or missing memo' });
+            return res.status(400).json({ message: 'Transaction not found on-chain or missing memo. Ensure you broadcasted the exact unsignedTx from prepare on the same RPC cluster, then retry confirm after 2-5 seconds.' });
         if (memo.op !== 'sell_prediction' || memo.marketId !== marketId.trim() || memo.side !== side || Number(memo.quantity) !== parsedQuantity) {
             return res.status(400).json({ message: 'Transaction memo does not match request parameters' });
         }
@@ -1670,9 +1821,17 @@ exchangeRouter.post('/markets/claim/prepare', async (req, res) => {
         const fee = computeFeeBreakdown(grossPayout);
         const netPayout = fee.netAmount;
         const payer = getPlatformSigner();
+        const connection = getSolanaConnection();
         const userWallet = new PublicKey(user.walletAddress);
-        const { blockhash } = await getSolanaConnection().getLatestBlockhash('confirmed');
+        const netPayoutLamports = quoteAmountToLamports(netPayout);
+        const netPayoutSol = quoteAmountToSol(netPayout);
+        const { blockhash } = await connection.getLatestBlockhash('confirmed');
         const tx = new Transaction({ feePayer: payer.publicKey, recentBlockhash: blockhash });
+        tx.add(SystemProgram.transfer({
+            fromPubkey: payer.publicKey,
+            toPubkey: userWallet,
+            lamports: netPayoutLamports,
+        }));
         tx.add(new TransactionInstruction({
             programId: MEMO_PROGRAM_ID,
             keys: [{ pubkey: userWallet, isSigner: true, isWritable: false }],
@@ -1698,6 +1857,9 @@ exchangeRouter.post('/markets/claim/prepare', async (req, res) => {
                     feeBps: fee.feeBps,
                     feeAmount: fee.feeAmount,
                 },
+                settlementAsset: 'SOL',
+                settlementAmountSol: netPayoutSol,
+                settlementLamports: netPayoutLamports,
                 teamAName: market.match.teamA.name,
                 teamBName: market.match.teamB.name,
             },
@@ -1720,7 +1882,7 @@ exchangeRouter.post('/markets/claim/confirm', async (req, res) => {
             return res.status(400).json({ message: 'marketId is required' });
         const memo = await getConfirmedTxMemo(txSignature.trim());
         if (!memo)
-            return res.status(400).json({ message: 'Transaction not found on-chain or missing memo' });
+            return res.status(400).json({ message: 'Transaction not found on-chain or missing memo. Ensure you broadcasted the exact unsignedTx from prepare on the same RPC cluster, then retry confirm after 2-5 seconds.' });
         if (memo.op !== 'claim_reward' || memo.marketId !== marketId.trim()) {
             return res.status(400).json({ message: 'Transaction memo does not match request parameters' });
         }
@@ -1770,9 +1932,6 @@ exchangeRouter.post('/markets/claim/confirm', async (req, res) => {
                 alreadyClaimed: false,
             };
         });
-        const payoutTransfer = result.alreadyClaimed
-            ? null
-            : await sendSolPayoutToUser(user.walletAddress, result.netPayout);
         return res.json({
             message: result.alreadyClaimed ? 'Rewards already claimed' : 'Rewards claimed',
             payout: result.netPayout,
@@ -1784,7 +1943,6 @@ exchangeRouter.post('/markets/claim/confirm', async (req, res) => {
                     grossPayout: result.grossPayout,
                     netPayout: result.netPayout,
                 },
-            payoutTransfer,
             transaction: result.transaction,
         });
     }
@@ -1930,7 +2088,6 @@ exchangeRouter.get('/admin/transactions', async (req, res) => {
         return res.status(500).json({ message: 'Failed to fetch transactions' });
     }
 });
-// ─── USER PORTFOLIO ──────────────────────────────────────────────────────────
 exchangeRouter.get('/user/portfolio', async (req, res) => {
     try {
         const user = await getUserFromAuthHeader(req.headers.authorization);

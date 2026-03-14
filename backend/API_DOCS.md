@@ -39,7 +39,7 @@ Prediction market is an **AMM/pool P2P model** (not orderbook). Users trade agai
 ## 3) Config Knobs (Devnet)
 
 - `PLATFORM_FEE_BPS` (default `100` = 1.00%, max 200)
-- `CLAIM_SOL_PER_USDC` (default `0.0001`) for devnet payout conversion in claim confirm
+- `SOL_PER_USDC` (default `0.0001`) - conversion rate used to settle quote amounts in devnet SOL
 - `AUTH_SIGN_MESSAGE`
 - `ADMIN_WALLETS`
 
@@ -351,7 +351,7 @@ Prepare response includes gross/net + fee breakdown.
 }
 ```
 
-Confirm response now includes devnet treasury payout transfer:
+Confirm response includes fee breakdown and recorded claim transaction:
 
 ```json
 {
@@ -362,11 +362,6 @@ Confirm response now includes devnet treasury payout transfer:
     "feeAmount": 1,
     "grossPayout": 99,
     "netPayout": 98
-  },
-  "payoutTransfer": {
-    "txSignature": "<devnet transfer tx>",
-    "lamports": 9800000,
-    "solAmount": 0.0098
   },
   "transaction": {
     "txType": "CLAIM_REWARD"
@@ -1488,6 +1483,12 @@ Success response:
 {
   "message": "Rewards claimed",
   "payout": 44.6,
+  "feeBreakdown": {
+    "feeBps": 100,
+    "feeAmount": 0.45,
+    "grossPayout": 45.05,
+    "netPayout": 44.6
+  },
   "transaction": {
     "id": "cm8tx127",
     "userId": "cm8user123",
@@ -1975,10 +1976,19 @@ Important environment variables used by this backend:
 - `DATABASE_URL`
 - `SOLANA_RPC_URL`
 - `PLATFORM_SIGNER_SECRET`
+- `USDC_MINT_ADDRESS`
+- `USDC_DECIMALS`
 - `ADMIN_API_KEY`
 - `ADMIN_WALLETS`
 - `ADMIN_MINT_WALLET`
 - ImageKit-related variables required by metadata upload flow
+
+### Devnet Funding Notes
+
+- Devnet airdrop gives SOL, and this backend now settles trades in SOL only.
+- Buy routes deduct SOL from the user wallet and send it to the platform treasury wallet.
+- Sell and claim routes pay SOL from the platform treasury wallet back to the user wallet.
+- Ensure treasury wallet (`PLATFORM_SIGNER_SECRET`) is pre-funded with enough devnet SOL for payouts.
 
 ## Product Behavior Summary
 
@@ -1987,7 +1997,9 @@ Important environment variables used by this backend:
 - Assets use a bonding curve
 - Buying increases `circulating` supply and raises price
 - Selling decreases `circulating` supply and lowers price
-- Asset transfer is a real SPL token movement on devnet
+- Asset token transfer is a real SPL token movement on devnet
+- Asset buys also transfer devnet SOL from user wallet -> treasury wallet
+- Asset sells transfer devnet SOL from treasury wallet -> user wallet
 
 ### Prediction Market
 
@@ -1995,6 +2007,8 @@ Important environment variables used by this backend:
 - Market supply and liquidity are updated in the database after `confirm`
 - Settlement occurs when admin posts the result
 - Reward claims are proportional to winning-side ownership
+- Prediction buys transfer devnet SOL from user wallet -> treasury wallet
+- Prediction sells and claims transfer devnet SOL from treasury wallet -> user wallet
 
 ### Idempotency
 
