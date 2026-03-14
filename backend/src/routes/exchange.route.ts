@@ -32,6 +32,9 @@ import { uploadFile } from '../config/imageKit.config.js'
 const exchangeRouter = Router()
 const JWT_SECRET = process.env.JWT_SECRET ?? 'hello world'
 const AUTH_MESSAGE = process.env.AUTH_SIGN_MESSAGE ?? 'Sign into mechanical turks'
+const DEFAULT_ESCROW_PROGRAM_ID = '11111111111111111111111111111111'
+const ESCROW_PROGRAM_ID_RAW = process.env.ESCROW_PROGRAM_ID ?? DEFAULT_ESCROW_PROGRAM_ID
+const ESCROW_PROGRAM_ID = new PublicKey(ESCROW_PROGRAM_ID_RAW)
 
 const PLATFORM_FEE_BPS = (() => {
     const parsed = Number(process.env.PLATFORM_FEE_BPS ?? '100')
@@ -523,6 +526,14 @@ function parseBase64Image(input: unknown): Buffer | null {
     } catch {
         return null
     }
+}
+
+function getEscrowPda(propertyId: string): string {
+    const [pda] = PublicKey.findProgramAddressSync(
+        [Buffer.from('escrow'), Buffer.from(propertyId)],
+        ESCROW_PROGRAM_ID,
+    )
+    return pda.toBase58()
 }
 
 async function sendSolPayoutToUser(walletAddress: string, payoutUsdc: number): Promise<{ txSignature: string; lamports: number; solAmount: number }> {
@@ -1300,6 +1311,15 @@ exchangeRouter.post('/admin/usdc/fund', async (req, res) => {
         console.log(error)
         return res.status(500).json({ message: (error as Error).message || 'Failed to fund devnet USDC' })
     }
+})
+
+exchangeRouter.get('/escrow/program-status', (req, res) => {
+    const propertyId = typeof req.query.propertyId === 'string' ? req.query.propertyId.trim() : ''
+    return res.json({
+        escrowProgramId: ESCROW_PROGRAM_ID.toBase58(),
+        isConfigured: ESCROW_PROGRAM_ID_RAW !== DEFAULT_ESCROW_PROGRAM_ID,
+        ...(propertyId ? { propertyId, sampleEscrowPda: getEscrowPda(propertyId) } : {}),
+    })
 })
 
 exchangeRouter.get('/teams', async (_req, res) => {

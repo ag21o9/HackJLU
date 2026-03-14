@@ -9,7 +9,9 @@ const JWT_SECRET = process.env.JWT_SECRET ?? 'hello world';
 const DEFAULT_PLATFORM_FEE_BPS = Number(process.env.PLATFORM_FEE_BPS ?? 200);
 const USDC_MINT_ADDRESS = process.env.USDC_MINT_ADDRESS ?? '';
 const MEMO_PROGRAM_ID = new PublicKey('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr');
-const ESCROW_PROGRAM_ID = new PublicKey(process.env.ESCROW_PROGRAM_ID ?? '11111111111111111111111111111111');
+const DEFAULT_ESCROW_PROGRAM_ID = '11111111111111111111111111111111';
+const ESCROW_PROGRAM_ID_RAW = process.env.ESCROW_PROGRAM_ID ?? DEFAULT_ESCROW_PROGRAM_ID;
+const ESCROW_PROGRAM_ID = new PublicKey(ESCROW_PROGRAM_ID_RAW);
 function getSolanaConnection() {
     const rpcUrl = process.env.SOLANA_RPC_URL ?? clusterApiUrl('devnet');
     return new Connection(rpcUrl, 'confirmed');
@@ -81,6 +83,14 @@ function getEscrowPda(propertyId) {
     const [pda] = PublicKey.findProgramAddressSync([Buffer.from('escrow'), Buffer.from(propertyId)], ESCROW_PROGRAM_ID);
     return pda.toBase58();
 }
+tradingRouter.get('/escrow/program-status', (req, res) => {
+    const propertyId = typeof req.query.propertyId === 'string' ? req.query.propertyId.trim() : '';
+    return res.json({
+        escrowProgramId: ESCROW_PROGRAM_ID.toBase58(),
+        isConfigured: ESCROW_PROGRAM_ID_RAW !== DEFAULT_ESCROW_PROGRAM_ID,
+        ...(propertyId ? { sampleEscrowPda: getEscrowPda(propertyId), propertyId } : {}),
+    });
+});
 async function getUsdcTokenAccountAddress(walletAddress) {
     if (!USDC_MINT_ADDRESS)
         return null;

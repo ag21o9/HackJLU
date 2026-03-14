@@ -3,7 +3,12 @@
     "dev": "ts-node src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "postinstall": "npx prisma generate"
+    "postinstall": "npx prisma generate",
+    "deploy:escrow:devnet": "powershell -ExecutionPolicy Bypass -File ./scripts/deploy-basic-escrow-devnet.ps1",
+    "deploy:asset-mint:devnet": "powershell -ExecutionPolicy Bypass -File ./scripts/deploy-asset-mint-devnet.ps1",
+    "deploy:bonding-curve:devnet": "powershell -ExecutionPolicy Bypass -File ./scripts/deploy-bonding-curve-devnet.ps1",
+    "deploy:prediction-market:devnet": "powershell -ExecutionPolicy Bypass -File ./scripts/deploy-prediction-market-devnet.ps1",
+    "deploy:contracts:devnet": "npm run deploy:asset-mint:devnet; npm run deploy:bonding-curve:devnet; npm run deploy:prediction-market:devnet"
   },
   "type": "module",
   "dependencies": {
