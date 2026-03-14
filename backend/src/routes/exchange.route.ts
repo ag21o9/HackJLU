@@ -2222,8 +2222,6 @@ exchangeRouter.get('/admin/transactions', async (req, res) => {
     }
 })
 
-// ─── USER PORTFOLIO ──────────────────────────────────────────────────────────
-
 exchangeRouter.get('/user/portfolio', async (req, res) => {
     try {
         const user = await getUserFromAuthHeader(req.headers.authorization)
